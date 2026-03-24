@@ -1,0 +1,16 @@
+[package]
+name = "erofs-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Custom LibAFL input type for EROFS images"
+
+[dependencies]
+libafl = { workspace = true }
+libafl_bolts = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+erofs-format = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,27 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Fuzzer outputs
+/crashes/
+/corpus/
+/seeds/
+/outputs/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp

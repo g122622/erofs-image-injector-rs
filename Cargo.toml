@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "erofs-fuzzer",
+    "erofs-format",
+    "erofs-mutator",
+    "erofs-generator",
+    "erofs-input",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["GSoC 2026 EROFS Fuzzing Project"]
+repository = "https://github.com/your-repo/erofs-image-injector-rs"
+description = "LibAFL-based EROFS image fuzzing and injection tool"
+
+[workspace.dependencies]
+# LibAFL dependencies
+libafl = "0.16"
+libafl_bolts = "0.16"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+tempfile = "3"
+walkdir = "2"
+memmap2 = "0.9"
+
+# Internal crates
+erofs-format = { path = "erofs-format" }
+erofs-mutator = { path = "erofs-mutator" }
+erofs-generator = { path = "erofs-generator" }
+erofs-input = { path = "erofs-input" }

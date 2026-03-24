@@ -1,0 +1,16 @@
+[package]
+name = "erofs-generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "EROFS seed image generator using mkfs.erofs"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+erofs-format = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,19 @@
+[package]
+name = "erofs-mutator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Structure-aware mutators for EROFS image fuzzing"
+
+[dependencies]
+libafl = { workspace = true }
+libafl_bolts = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+erofs-format = { workspace = true }
+erofs-input = { workspace = true }
+rand = "0.9"
+
+[dev-dependencies]

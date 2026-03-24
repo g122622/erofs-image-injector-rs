@@ -1,0 +1,34 @@
+[package]
+name = "erofs-fuzzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Main fuzzer binary for EROFS image injection"
+
+[[bin]]
+name = "erofs-fuzzer"
+path = "src/main.rs"
+
+[dependencies]
+libafl = { workspace = true }
+libafl_bolts = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+erofs-format = { workspace = true }
+erofs-mutator = { workspace = true }
+erofs-generator = { workspace = true }
+erofs-input = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
+libc = "0.2"
+
+[dev-dependencies]
