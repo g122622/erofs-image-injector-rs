@@ -2,23 +2,19 @@
 //!
 //! Executor that runs erofsfuse to mount and test EROFS images.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tracing::{debug, error, info, trace, warn};
 
 use libafl::executors::ExitKind;
 use libafl::inputs::Input;
-use libafl::state::HasMetadata;
 use libafl_bolts::Error;
-use libafl_bolts::rands::Rand;
 
 use erofs_input::ErofsImageInput;
 
-use crate::FuzzerConfig;
+use crate::cli::FuzzerConfig;
 
 /// Exit kind for erofsfuse execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +35,7 @@ pub enum ErofsfuseExit {
 ///
 /// This executor writes the image to a temp file, mounts it using erofsfuse,
 /// performs file system operations, and detects crashes.
+#[derive(Debug)]
 pub struct ErofsfuseExecutor {
     /// Path to erofsfuse binary
     erofsfuse_path: PathBuf,
@@ -391,6 +388,20 @@ impl ErofsfuseExecutor {
     }
 }
 
+impl Clone for ErofsfuseExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            erofsfuse_path: self.erofsfuse_path.clone(),
+            mount_base: self.mount_base.clone(),
+            timeout: self.timeout,
+            max_size: self.max_size,
+            min_size: self.min_size,
+            keep_temp: self.keep_temp,
+            executions: 0,
+        }
+    }
+}
+
 /// Trait extension for waiting with timeout
 trait WaitTimeout {
     fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<std::process::ExitStatus>, std::io::Error>;
@@ -417,10 +428,11 @@ impl WaitTimeout for std::process::Child {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_executor_creation() {
-        let config = FuzzerConfig::from(CliArgs::parse_from(["test", "--seeds", "./seeds"]));
+        let config = FuzzerConfig::from(crate::cli::CliArgs::try_parse_from(["test", "--seeds", "./seeds"]).unwrap());
         let executor = ErofsfuseExecutor::new(&config);
         assert_eq!(executor.executions(), 0);
     }

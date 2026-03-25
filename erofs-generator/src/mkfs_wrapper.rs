@@ -30,7 +30,7 @@ impl MkfsWrapper {
         Ok(Self {
             path: path.to_path_buf(),
             default_options: Vec::new(),
-        }
+        })
     }
 
     /// Create a wrapper assuming mkfs.erofs is in PATH

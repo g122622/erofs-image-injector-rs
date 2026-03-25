@@ -95,7 +95,7 @@ cargo build --release
 | `-t, --timeout` | Timeout per execution (seconds) | `60` |
 | `-i, --iterations` | Maximum iterations (0 = unlimited) | `0` |
 | `--erofsfuse-path` | Path to erofsfuse binary | `erofsfuse` |
-| `-w, --workers` | Number of parallel workers | `4` |
+| `-w, --workers` | Number of parallel workers | `1` |
 | `--log-level` | Log level (trace/debug/info/warn/error) | `info` |
 
 ## Seed Generation

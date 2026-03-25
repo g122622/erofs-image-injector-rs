@@ -11,6 +11,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 erofs-format = { workspace = true }
+erofs-input = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]

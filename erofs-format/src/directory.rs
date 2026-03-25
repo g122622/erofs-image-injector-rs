@@ -7,7 +7,7 @@ use std::mem::size_of;
 ///
 /// Directory entries are sorted alphabetically, allowing binary search.
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ErofsDirent {
     /// Node ID (with METABOX bit for metabox entries)
     pub nid: u64,

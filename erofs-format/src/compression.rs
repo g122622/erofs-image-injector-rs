@@ -1,6 +1,7 @@
 //! EROFS Compression definitions
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::mem::size_of;
 
 /// Maximum supported encoded size of a physical compressed cluster
@@ -48,7 +49,7 @@ impl TryFrom<u8> for ZErofsCompression {
 /// All compression algorithms bitmap
 pub const Z_EROFS_ALL_COMPR_ALGS: u16 = (1 << 4) - 1;
 
-/// LZ4 compression config (14 bytes + length field = 16 bytes)
+/// LZ4 compression config (14 bytes)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ZErofsLz4Cfgs {
@@ -62,7 +63,7 @@ pub struct ZErofsLz4Cfgs {
 
 const _: () = assert!(size_of::<ZErofsLz4Cfgs>() == 14);
 
-/// LZMA compression config (14 bytes + length field = 16 bytes)
+/// LZMA compression config (14 bytes)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ZErofsLzmaCfgs {
@@ -79,7 +80,7 @@ const _: () = assert!(size_of::<ZErofsLzmaCfgs>() == 14);
 /// Maximum LZMA dictionary size
 pub const Z_EROFS_LZMA_MAX_DICT_SIZE: u64 = 8 * Z_EROFS_PCLUSTER_MAX_SIZE;
 
-/// DEFLATE compression config (6 bytes + length field = 8 bytes)
+/// DEFLATE compression config (6 bytes)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ZErofsDeflateCfgs {
@@ -91,7 +92,7 @@ pub struct ZErofsDeflateCfgs {
 
 const _: () = assert!(size_of::<ZErofsDeflateCfgs>() == 6);
 
-/// ZSTD compression config (6 bytes + length field = 8 bytes)
+/// ZSTD compression config (6 bytes)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ZErofsZstdCfgs {
@@ -145,18 +146,6 @@ pub struct ZErofsMapHeader {
     pub h_algorithmtype_or_extents_hi: ZErofsMapHeaderU2,
 }
 
-/// Union for fragment offset or inline data
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub union ZErofsMapHeaderU1 {
-    /// Fragment data offset in packed inode
-    pub h_fragmentoff: u32,
-    /// Inline data size and reserved
-    pub h_idata: ZErofsInlineData,
-    /// Extent count low bits
-    pub h_extents_lo: u32,
-}
-
 /// Inline data size
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -167,16 +156,6 @@ pub struct ZErofsInlineData {
     pub h_idata_size: u16,
 }
 
-/// Union for algorithm type or extent count high
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub union ZErofsMapHeaderU2 {
-    /// Algorithm type and cluster bits
-    pub h_algo: ZErofsAlgoInfo,
-    /// Extent count high bits
-    pub h_extents_hi: u16,
-}
-
 /// Algorithm type and cluster bits
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -185,6 +164,156 @@ pub struct ZErofsAlgoInfo {
     pub h_algorithmtype: u8,
     /// Cluster bits (bits 0-3: logical cluster bits - blkszbits)
     pub h_clusterbits: u8,
+}
+
+/// Union for fragment offset or inline data
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub union ZErofsMapHeaderU1 {
+    /// Fragment data offset in packed inode
+    pub h_fragmentoff: u32,
+    /// Inline data size and reserved
+    pub h_idata: ZErofsInlineData,
+    /// Extent count low bits
+    pub h_extents_lo: u32,
+}
+
+impl fmt::Debug for ZErofsMapHeaderU1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.h_fragmentoff };
+        f.debug_struct("ZErofsMapHeaderU1")
+            .field("h_fragmentoff", &val)
+            .finish()
+    }
+}
+
+impl Serialize for ZErofsMapHeaderU1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for ZErofsMapHeaderU1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ZErofsMapHeaderU1Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for ZErofsMapHeaderU1Visitor {
+            type Value = ZErofsMapHeaderU1;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 4 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 4 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = ZErofsMapHeaderU1 { h_fragmentoff: 0 };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut ZErofsMapHeaderU1 as *mut u8,
+                        4,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(ZErofsMapHeaderU1Visitor)
+    }
+}
+
+impl Default for ZErofsMapHeaderU1 {
+    fn default() -> Self {
+        Self { h_fragmentoff: 0 }
+    }
+}
+
+/// Union for algorithm type or extent count high
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub union ZErofsMapHeaderU2 {
+    /// Algorithm type and cluster bits
+    pub h_algo: ZErofsAlgoInfo,
+    /// Extent count high bits
+    pub h_extents_hi: u16,
+}
+
+impl fmt::Debug for ZErofsMapHeaderU2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.h_extents_hi };
+        f.debug_struct("ZErofsMapHeaderU2")
+            .field("h_extents_hi", &val)
+            .finish()
+    }
+}
+
+impl Serialize for ZErofsMapHeaderU2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for ZErofsMapHeaderU2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ZErofsMapHeaderU2Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for ZErofsMapHeaderU2Visitor {
+            type Value = ZErofsMapHeaderU2;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 2 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 2 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = ZErofsMapHeaderU2 { h_extents_hi: 0 };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut ZErofsMapHeaderU2 as *mut u8,
+                        2,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(ZErofsMapHeaderU2Visitor)
+    }
+}
+
+impl Default for ZErofsMapHeaderU2 {
+    fn default() -> Self {
+        Self { h_extents_hi: 0 }
+    }
 }
 
 const _: () = assert!(size_of::<ZErofsMapHeader>() == 8);
@@ -226,12 +355,76 @@ pub struct ZErofsLclusterIndex {
 
 /// Union for lcluster index
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 pub union ZErofsLclusterIndexU {
     /// Block address for HEAD lclusters
     pub blkaddr: u32,
     /// Delta values for NONHEAD lclusters
     pub delta: [u16; 2],
+}
+
+impl fmt::Debug for ZErofsLclusterIndexU {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.blkaddr };
+        f.debug_struct("ZErofsLclusterIndexU")
+            .field("blkaddr", &val)
+            .finish()
+    }
+}
+
+impl Serialize for ZErofsLclusterIndexU {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for ZErofsLclusterIndexU {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ZErofsLclusterIndexUVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ZErofsLclusterIndexUVisitor {
+            type Value = ZErofsLclusterIndexU;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 4 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 4 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = ZErofsLclusterIndexU { blkaddr: 0 };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut ZErofsLclusterIndexU as *mut u8,
+                        4,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(ZErofsLclusterIndexUVisitor)
+    }
+}
+
+impl Default for ZErofsLclusterIndexU {
+    fn default() -> Self {
+        Self { blkaddr: 0 }
+    }
 }
 
 const _: () = assert!(size_of::<ZErofsLclusterIndex>() == 8);
@@ -259,25 +452,19 @@ pub const Z_EROFS_EXTENT_PLEN_FMT_BIT: u32 = 1 << 28;
 pub const Z_EROFS_EXTENT_PLEN_MASK: u64 =
     (Z_EROFS_PCLUSTER_MAX_SIZE << 1) - 1;
 
-/// Z_EROFS extent (20 bytes)
+/// Z_EROFS extent (12 bytes for basic)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ZErofsExtent {
-    /// Encoded length
+    /// Encoded length with flags
     pub plen: u32,
     /// Physical offset (low 32 bits)
     pub pstart_lo: u32,
-    /// Physical offset (high 32 bits)
-    pub pstart_hi: u32,
-    /// Logical offset (low 32 bits)
-    pub lstart_lo: u32,
-    /// Logical offset (high 32 bits)
-    pub lstart_hi: u32,
-    /// Reserved for future use
-    pub reserved: [u8; 12],
+    /// Physical offset (high 32 bits) or logical offset
+    pub pstart_hi_or_lstart: u32,
 }
 
-const _: () = assert!(size_of::<ZErofsExtent>() == 20);
+const _: () = assert!(size_of::<ZErofsExtent>() == 12);
 
 /// Get extent record size based on advise flags
 pub fn z_erofs_extent_recsize(advise: u16) -> usize {
@@ -313,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_extent_size() {
-        assert_eq!(size_of::<ZErofsExtent>(), 20);
+        assert_eq!(size_of::<ZErofsExtent>(), 12);
     }
 
     #[test]

@@ -18,8 +18,8 @@ description = "LibAFL-based EROFS image fuzzing and injection tool"
 
 [workspace.dependencies]
 # LibAFL dependencies
-libafl = "0.16"
-libafl_bolts = "0.16"
+libafl = "0.15"
+libafl_bolts = "0.15"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

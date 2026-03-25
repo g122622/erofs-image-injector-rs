@@ -2,13 +2,16 @@
 //!
 //! Structure-aware mutations targeting EROFS directory entry structures.
 
+use libafl::corpus::CorpusId;
 use libafl::mutators::{Mutator, MutationResult};
-use libafl::state::HasMetadata;
+use libafl::state::HasRand;
+use libafl_bolts::Named;
 use libafl_bolts::rands::Rand;
 use libafl_bolts::Error;
+use std::borrow::Cow;
 use tracing::{debug, trace};
 
-use crate::{arithmetic_mutate, interesting_value_mutate, set_random_bytes};
+use crate::{rand_below, arithmetic_mutate, set_random_bytes};
 use erofs_format::ErofsDirent;
 use erofs_input::ErofsImageInput;
 
@@ -19,6 +22,13 @@ use erofs_input::ErofsImageInput;
 pub struct ErofsDirectoryMutator {
     /// Minimum dirent size
     min_dirent_size: usize,
+}
+
+impl Named for ErofsDirectoryMutator {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("ErofsDirectoryMutator");
+        &NAME
+    }
 }
 
 impl ErofsDirectoryMutator {
@@ -47,7 +57,7 @@ impl ErofsDirectoryMutator {
     /// Select a random dirent field to mutate
     fn select_dirent_field<R: Rand>(&self, rng: &mut R) -> DirentField {
         let fields = [DirentField::Nid, DirentField::NameOff, DirentField::FileType];
-        fields[rng.below(fields.len() as u64) as usize]
+        fields[rand_below(rng, fields.len())]
     }
 
     /// Mutate a specific dirent field
@@ -62,7 +72,7 @@ impl ErofsDirectoryMutator {
             DirentField::Nid => {
                 // nid (u64 at offset 0)
                 let nid_offset = offset;
-                let mutation_type = rng.below(5);
+                let mutation_type = rand_below(rng, 5);
 
                 match mutation_type {
                     0 => {
@@ -94,7 +104,7 @@ impl ErofsDirectoryMutator {
             DirentField::NameOff => {
                 // nameoff (u16 at offset 8)
                 let nameoff_offset = offset + 8;
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
 
                 match mutation_type {
                     0 => {
@@ -120,7 +130,7 @@ impl ErofsDirectoryMutator {
             DirentField::FileType => {
                 // file_type (u8 at offset 10)
                 let ftype_offset = offset + 10;
-                let mutation_type = rng.below(5);
+                let mutation_type = rand_below(rng, 5);
 
                 match mutation_type {
                     0 => {
@@ -168,7 +178,7 @@ impl ErofsDirectoryMutator {
             return MutationResult::Skipped;
         }
 
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
 
         match mutation_type {
             0 => {
@@ -182,13 +192,13 @@ impl ErofsDirectoryMutator {
             }
             2 => {
                 // Invalid characters
-                let char_offset = name_offset + (rng.below(actual_len as u64) as usize);
+                let char_offset = name_offset + rand_below(rng, actual_len);
                 data[char_offset] = 0xFF; // Invalid UTF-8
             }
             _ => {
                 // Bit flip in name
-                let byte_offset = name_offset + (rng.below(actual_len as u64) as usize);
-                data[byte_offset] ^= 1 << (rng.below(8) as u8);
+                let byte_offset = name_offset + rand_below(rng, actual_len);
+                data[byte_offset] ^= 1 << (rand_below(rng, 8) as u8);
             }
         }
 
@@ -209,7 +219,7 @@ enum DirentField {
 
 impl<S> Mutator<ErofsImageInput, S> for ErofsDirectoryMutator
 where
-    S: HasMetadata,
+    S: HasRand,
 {
     fn mutate(
         &mut self,
@@ -217,14 +227,8 @@ where
         input: &mut ErofsImageInput,
     ) -> Result<MutationResult, Error> {
         let rng = state.rand_mut();
-        let data = input.data_mut();
 
-        if data.len() < self.min_dirent_size {
-            trace!("Image too small for directory mutation");
-            return Ok(MutationResult::Skipped);
-        }
-
-        // Find directory entry locations from injection points
+        // Find directory entry locations from injection points first
         let dirent_offsets: Vec<usize> = input
             .injection_points()
             .iter()
@@ -244,8 +248,15 @@ where
             return Ok(MutationResult::Skipped);
         }
 
+        let data = input.data_mut();
+
+        if data.len() < self.min_dirent_size {
+            trace!("Image too small for directory mutation");
+            return Ok(MutationResult::Skipped);
+        }
+
         // Select a random dirent to mutate
-        let offset = dirent_offsets[rng.below(dirent_offsets.len() as u64) as usize];
+        let offset = dirent_offsets[rand_below(rng, dirent_offsets.len())];
         trace!("Mutating dirent at offset {:#x}", offset);
 
         let result = self.mutate_dirent_at(data, offset, rng);
@@ -255,6 +266,10 @@ where
         }
 
         Ok(result)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -275,9 +290,7 @@ mod tests {
         }
     }
 
-    impl HasMetadata for TestState {}
-
-    impl libafl::state::UsesRand for TestState {
+    impl HasRand for TestState {
         type Rand = StdRand;
 
         fn rand(&self) -> &Self::Rand {

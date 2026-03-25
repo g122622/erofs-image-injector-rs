@@ -2,15 +2,18 @@
 //!
 //! Structure-aware mutations targeting the EROFS super block.
 
+use libafl::corpus::CorpusId;
 use libafl::mutators::{Mutator, MutationResult};
-use libafl::state::HasMetadata;
+use libafl::state::HasRand;
+use libafl_bolts::Named;
 use libafl_bolts::rands::Rand;
 use libafl_bolts::Error;
+use std::borrow::Cow;
 use tracing::{debug, trace};
 
-use crate::{arithmetic_mutate, interesting_value_mutate, set_random_bytes};
+use crate::{rand_below, arithmetic_mutate, interesting_value_mutate, set_random_bytes};
 use erofs_format::{ErofsSuperBlock, EROFS_SUPER_OFFSET};
-use erofs_input::{ErofsImageInput, InjectionPoint, SuperblockField};
+use erofs_input::{ErofsImageInput, SuperblockField};
 
 /// Superblock mutator for EROFS images
 ///
@@ -24,6 +27,13 @@ pub struct ErofsSuperblockMutator {
 impl Default for ErofsSuperblockMutator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Named for ErofsSuperblockMutator {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("ErofsSuperblockMutator");
+        &NAME
     }
 }
 
@@ -47,7 +57,7 @@ impl ErofsSuperblockMutator {
         match field {
             SuperblockField::Magic => {
                 // Rarely mutate magic - usually want to keep it valid
-                if rng.below(20) == 0 {
+                if rand_below(rng, 20) == 0 {
                     // 5% chance
                     let offset = sb_offset;
                     interesting_value_mutate(&mut data[offset..offset + 4], rng, 4);
@@ -59,7 +69,7 @@ impl ErofsSuperblockMutator {
             SuperblockField::Checksum => {
                 // Corrupt checksum
                 let offset = sb_offset + 4;
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
                 match mutation_type {
                     0 => {
                         // Set to zero
@@ -88,23 +98,23 @@ impl ErofsSuperblockMutator {
             SuperblockField::Blkszbits => {
                 let offset = sb_offset + 12;
                 // Valid values are 9-16 (512 to 65536 bytes)
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
                 match mutation_type {
                     0 => {
                         // Set to invalid small value
-                        data[offset] = rng.below(9) as u8;
+                        data[offset] = rand_below(rng, 9) as u8;
                     }
                     1 => {
                         // Set to invalid large value
-                        data[offset] = 17 + (rng.below(16) as u8);
+                        data[offset] = 17 + (rand_below(rng, 16) as u8);
                     }
                     2 => {
                         // Valid but unusual
-                        data[offset] = 9 + (rng.below(8) as u8);
+                        data[offset] = 9 + (rand_below(rng, 8) as u8);
                     }
                     _ => {
                         // Bit flip
-                        data[offset] ^= 1 << (rng.below(8) as u8);
+                        data[offset] ^= 1 << (rand_below(rng, 8) as u8);
                     }
                 }
                 debug!("Mutated blkszbits to {}", data[offset]);
@@ -112,13 +122,13 @@ impl ErofsSuperblockMutator {
             }
             SuperblockField::SbExtslots => {
                 let offset = sb_offset + 13;
-                data[offset] = rng.below(256) as u8;
+                data[offset] = rand_below(rng, 256) as u8;
                 MutationResult::Mutated
             }
             SuperblockField::RootNid => {
                 let offset = sb_offset + 14;
                 // Mutate root nid (16-bit)
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
                 match mutation_type {
                     0 => {
                         // Set to zero
@@ -165,17 +175,17 @@ impl ErofsSuperblockMutator {
             SuperblockField::Uuid => {
                 let offset = sb_offset + 48;
                 // Mutate UUID bytes
-                let uuid_offset = rng.below(16) as usize;
-                data[offset + uuid_offset] ^= rng.below(256) as u8;
+                let uuid_offset = rand_below(rng, 16);
+                data[offset + uuid_offset] ^= rand_below(rng, 256) as u8;
                 MutationResult::Mutated
             }
             SuperblockField::VolumeName => {
                 let offset = sb_offset + 64;
                 // Mutate volume name (16 bytes)
-                let name_offset = rng.below(16) as usize;
+                let name_offset = rand_below(rng, 16);
                 if data[offset + name_offset] != 0 {
                     // Don't mutate null terminator
-                    data[offset + name_offset] = rng.below(128) as u8; // ASCII range
+                    data[offset + name_offset] = rand_below(rng, 128) as u8; // ASCII range
                 }
                 MutationResult::Mutated
             }
@@ -194,11 +204,11 @@ impl ErofsSuperblockMutator {
             SuperblockField::Dirblkbits => {
                 let offset = sb_offset + 88;
                 // Similar to blkszbits
-                let mutation_type = rng.below(3);
+                let mutation_type = rand_below(rng, 3);
                 match mutation_type {
-                    0 => data[offset] = 9 + (rng.below(8) as u8),
-                    1 => data[offset] = rng.below(9) as u8,
-                    _ => data[offset] ^= 1 << (rng.below(8) as u8),
+                    0 => data[offset] = 9 + (rand_below(rng, 8) as u8),
+                    1 => data[offset] = rand_below(rng, 9) as u8,
+                    _ => data[offset] ^= 1 << (rand_below(rng, 8) as u8),
                 }
                 MutationResult::Mutated
             }
@@ -215,12 +225,12 @@ impl ErofsSuperblockMutator {
 
     /// Mutate feature flags
     fn mutate_feature_flags<R: Rand>(&self, data: &mut [u8], rng: &mut R, is_compat: bool) -> MutationResult {
-        let mutation_type = rng.below(5);
+        let mutation_type = rand_below(rng, 5);
 
         match mutation_type {
             0 => {
                 // Set random flag
-                let bit = rng.below(32) as usize;
+                let bit = rand_below(rng, 32);
                 let byte_idx = bit / 8;
                 let bit_idx = bit % 8;
                 data[byte_idx] ^= 1 << bit_idx;
@@ -247,7 +257,7 @@ impl ErofsSuperblockMutator {
                         0x00000007, // SB_CHKSUM | MTIME | XATTR_FILTER
                         0xFFFFFFFF, // All flags
                     ];
-                    let flag = flags[rng.below(4) as usize];
+                    let flag = flags[rand_below(rng, 4)];
                     data.copy_from_slice(&flag.to_le_bytes());
                 } else {
                     // Known incompat flags
@@ -257,7 +267,7 @@ impl ErofsSuperblockMutator {
                         0x000000FF, // Many features
                         0xFFFFFFFF, // All flags (invalid)
                     ];
-                    let flag = flags[rng.below(4) as usize];
+                    let flag = flags[rand_below(rng, 4)];
                     data.copy_from_slice(&flag.to_le_bytes());
                 }
             }
@@ -268,7 +278,7 @@ impl ErofsSuperblockMutator {
 
     /// Mutate a 16-bit field
     fn mutate_16bit_field<R: Rand>(&self, data: &mut [u8], rng: &mut R) -> MutationResult {
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
 
         match mutation_type {
             0 => {
@@ -290,7 +300,7 @@ impl ErofsSuperblockMutator {
 
     /// Mutate a 32-bit field
     fn mutate_32bit_field<R: Rand>(&self, data: &mut [u8], rng: &mut R) -> MutationResult {
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
 
         match mutation_type {
             0 => {
@@ -312,7 +322,7 @@ impl ErofsSuperblockMutator {
 
     /// Mutate a 64-bit field
     fn mutate_64bit_field<R: Rand>(&self, data: &mut [u8], rng: &mut R) -> MutationResult {
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
 
         match mutation_type {
             0 => {
@@ -348,13 +358,13 @@ impl ErofsSuperblockMutator {
             SuperblockField::PackedNid,
         ];
 
-        fields[rng.below(fields.len() as u64) as usize].clone()
+        fields[rand_below(rng, fields.len())].clone()
     }
 }
 
 impl<S> Mutator<ErofsImageInput, S> for ErofsSuperblockMutator
 where
-    S: HasMetadata,
+    S: HasRand,
 {
     fn mutate(
         &mut self,
@@ -383,6 +393,10 @@ where
 
         Ok(result)
     }
+
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -402,9 +416,7 @@ mod tests {
         }
     }
 
-    impl HasMetadata for TestState {}
-
-    impl libafl::state::UsesRand for TestState {
+    impl HasRand for TestState {
         type Rand = StdRand;
 
         fn rand(&self) -> &Self::Rand {

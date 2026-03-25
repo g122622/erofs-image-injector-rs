@@ -2,13 +2,16 @@
 //!
 //! Structure-aware mutations targeting EROFS extended attribute structures.
 
+use libafl::corpus::CorpusId;
 use libafl::mutators::{Mutator, MutationResult};
-use libafl::state::HasMetadata;
+use libafl::state::HasRand;
+use libafl_bolts::Named;
 use libafl_bolts::rands::Rand;
 use libafl_bolts::Error;
+use std::borrow::Cow;
 use tracing::{debug, trace};
 
-use crate::{arithmetic_mutate, interesting_value_mutate, set_random_bytes};
+use crate::{rand_below, arithmetic_mutate, interesting_value_mutate, set_random_bytes};
 use erofs_input::ErofsImageInput;
 
 /// Xattr mutator for EROFS images
@@ -18,6 +21,13 @@ use erofs_input::ErofsImageInput;
 pub struct ErofsXattrMutator {
     /// Minimum xattr entry size
     min_xattr_size: usize,
+}
+
+impl Named for ErofsXattrMutator {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("ErofsXattrMutator");
+        &NAME
+    }
 }
 
 impl ErofsXattrMutator {
@@ -52,7 +62,7 @@ impl ErofsXattrMutator {
             XattrField::NameData,
             XattrField::ValueData,
         ];
-        fields[rng.below(fields.len() as u64) as usize]
+        fields[rand_below(rng, fields.len())]
     }
 
     /// Mutate a specific xattr field
@@ -67,7 +77,7 @@ impl ErofsXattrMutator {
             XattrField::NameLen => {
                 // e_name_len (u8 at offset 0)
                 let namelen_offset = offset;
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
 
                 match mutation_type {
                     0 => {
@@ -80,11 +90,11 @@ impl ErofsXattrMutator {
                     }
                     2 => {
                         // Random length
-                        data[namelen_offset] = rng.below(256) as u8;
+                        data[namelen_offset] = rand_below(rng, 256) as u8;
                     }
                     _ => {
                         // Bit flip
-                        data[namelen_offset] ^= 1 << (rng.below(8) as u8);
+                        data[namelen_offset] ^= 1 << (rand_below(rng, 8) as u8);
                     }
                 }
 
@@ -94,7 +104,7 @@ impl ErofsXattrMutator {
             XattrField::NameIndex => {
                 // e_name_index (u8 at offset 1)
                 let index_offset = offset + 1;
-                let mutation_type = rng.below(5);
+                let mutation_type = rand_below(rng, 5);
 
                 match mutation_type {
                     0 => {
@@ -107,7 +117,7 @@ impl ErofsXattrMutator {
                     }
                     2 => {
                         // Long prefix flag
-                        data[index_offset] = 0x80 | (rng.below(8) as u8);
+                        data[index_offset] = 0x80 | (rand_below(rng, 8) as u8);
                     }
                     3 => {
                         // Invalid index
@@ -115,7 +125,7 @@ impl ErofsXattrMutator {
                     }
                     _ => {
                         // Random
-                        data[index_offset] = rng.below(256) as u8;
+                        data[index_offset] = rand_below(rng, 256) as u8;
                     }
                 }
 
@@ -125,7 +135,7 @@ impl ErofsXattrMutator {
             XattrField::ValueSize => {
                 // e_value_size (u16 at offset 2)
                 let valuesize_offset = offset + 2;
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
 
                 match mutation_type {
                     0 => {
@@ -166,13 +176,13 @@ impl ErofsXattrMutator {
                 if name_len == 0 {
                     // Mutate the reserved byte instead
                     if name_offset < data.len() {
-                        data[name_offset] = rng.below(256) as u8;
+                        data[name_offset] = rand_below(rng, 256) as u8;
                         return MutationResult::Mutated;
                     }
                     return MutationResult::Skipped;
                 }
 
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
 
                 match mutation_type {
                     0 => {
@@ -185,13 +195,13 @@ impl ErofsXattrMutator {
                     }
                     2 => {
                         // Add null bytes in the middle
-                        let null_pos = name_offset + (rng.below(name_len as u64) as usize);
+                        let null_pos = name_offset + rand_below(rng, name_len);
                         data[null_pos] = 0;
                     }
                     _ => {
                         // Bit flip
-                        let byte_pos = name_offset + (rng.below(name_len as u64) as usize);
-                        data[byte_pos] ^= 1 << (rng.below(8) as u8);
+                        let byte_pos = name_offset + rand_below(rng, name_len);
+                        data[byte_pos] ^= 1 << (rand_below(rng, 8) as u8);
                     }
                 }
 
@@ -218,7 +228,7 @@ impl ErofsXattrMutator {
                     return MutationResult::Skipped;
                 }
 
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
 
                 match mutation_type {
                     0 => {
@@ -239,8 +249,8 @@ impl ErofsXattrMutator {
                     }
                     _ => {
                         // Single byte mutation
-                        let byte_pos = value_offset + (rng.below(value_size as u64) as usize);
-                        data[byte_pos] ^= 1 << (rng.below(8) as u8);
+                        let byte_pos = value_offset + rand_below(rng, value_size);
+                        data[byte_pos] ^= 1 << (rand_below(rng, 8) as u8);
                     }
                 }
 
@@ -262,13 +272,13 @@ impl ErofsXattrMutator {
             return MutationResult::Skipped;
         }
 
-        let field = rng.below(3);
+        let field = rand_below(rng, 3);
 
         match field {
             0 => {
                 // Mutate h_name_filter (u32 at offset 0)
                 let filter_offset = offset;
-                let mutation_type = rng.below(3);
+                let mutation_type = rand_below(rng, 3);
                 match mutation_type {
                     0 => data[filter_offset..filter_offset + 4].fill(0),
                     1 => data[filter_offset..filter_offset + 4].fill(0xFF),
@@ -279,11 +289,11 @@ impl ErofsXattrMutator {
             1 => {
                 // Mutate h_shared_count (u8 at offset 4)
                 let count_offset = offset + 4;
-                let mutation_type = rng.below(3);
+                let mutation_type = rand_below(rng, 3);
                 match mutation_type {
                     0 => data[count_offset] = 0,
                     1 => data[count_offset] = 255,
-                    _ => data[count_offset] = rng.below(256) as u8,
+                    _ => data[count_offset] = rand_below(rng, 256) as u8,
                 }
                 debug!("Mutated xattr header shared_count");
             }
@@ -316,7 +326,7 @@ enum XattrField {
 
 impl<S> Mutator<ErofsImageInput, S> for ErofsXattrMutator
 where
-    S: HasMetadata,
+    S: HasRand,
 {
     fn mutate(
         &mut self,
@@ -324,14 +334,8 @@ where
         input: &mut ErofsImageInput,
     ) -> Result<MutationResult, Error> {
         let rng = state.rand_mut();
-        let data = input.data_mut();
 
-        if data.len() < self.min_xattr_size {
-            trace!("Image too small for xattr mutation");
-            return Ok(MutationResult::Skipped);
-        }
-
-        // Find xattr locations from injection points
+        // Find xattr locations from injection points first
         let xattr_offsets: Vec<usize> = input
             .injection_points()
             .iter()
@@ -349,8 +353,15 @@ where
             return Ok(MutationResult::Skipped);
         }
 
+        let data = input.data_mut();
+
+        if data.len() < self.min_xattr_size {
+            trace!("Image too small for xattr mutation");
+            return Ok(MutationResult::Skipped);
+        }
+
         // Select a random xattr to mutate
-        let offset = xattr_offsets[rng.below(xattr_offsets.len() as u64) as usize];
+        let offset = xattr_offsets[rand_below(rng, xattr_offsets.len())];
         trace!("Mutating xattr at offset {:#x}", offset);
 
         let result = self.mutate_xattr_at(data, offset, rng);
@@ -360,6 +371,10 @@ where
         }
 
         Ok(result)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -380,9 +395,7 @@ mod tests {
         }
     }
 
-    impl HasMetadata for TestState {}
-
-    impl libafl::state::UsesRand for TestState {
+    impl HasRand for TestState {
         type Rand = StdRand;
 
         fn rand(&self) -> &Self::Rand {

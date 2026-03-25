@@ -2,13 +2,11 @@
 //!
 //! Generate EROFS seed images with various configurations.
 
-use std::io::{Cursor, Write};
 use std::path::Path;
 
 use erofs_format::{
-    align_up, ErofsDataLayout, ErofsFileType, ErofsInodeCompact, ErofsSuperBlock,
-    ErofsSuperBlockU1, ErofsDirent, InodeNb, InodeU, RootNidOrBlocksHi,
-    EROFS_NAME_LEN, EROFS_SUPER_MAGIC_V1, EROFS_SUPER_OFFSET,
+    ErofsDataLayout, ErofsInodeCompact, ErofsSuperBlock, InodeNb, RootNidOrBlocksHi,
+    EROFS_SUPER_MAGIC_V1, EROFS_SUPER_OFFSET,
 };
 use erofs_input::ErofsImageInput;
 use tempfile::TempDir;
@@ -187,19 +185,19 @@ impl ErofsImageGenerator {
 
     /// Generate an image with a simple directory structure
     pub fn generate_simple(&mut self) -> GeneratorResult<ErofsImageInput> {
-        if let Some(ref wrapper) = self.mkfs_wrapper {
+        if self.mkfs_wrapper.is_some() {
             // Create temp directory with simple content
             let temp_dir = tempfile::tempdir()?;
-            self.temp_dirs.push(temp_dir.try_into()?);
-
-            let content_dir = &self.temp_dirs.last().unwrap();
+            let content_path = temp_dir.path().to_path_buf();
 
             // Create a simple directory structure
-            std::fs::create_dir_all(content_dir.path().join("dir1"))?;
-            std::fs::write(content_dir.path().join("file1.txt"), b"Hello, EROFS!")?;
-            std::fs::write(content_dir.path().join("dir1/file2.txt"), b"Nested file")?;
+            std::fs::create_dir_all(content_path.join("dir1"))?;
+            std::fs::write(content_path.join("file1.txt"), b"Hello, EROFS!")?;
+            std::fs::write(content_path.join("dir1/file2.txt"), b"Nested file")?;
 
-            self.generate_with_mkfs(content_dir.path())
+            self.temp_dirs.push(temp_dir);
+
+            self.generate_with_mkfs(&content_path)
         } else {
             // Fall back to minimal image
             self.generate_minimal()

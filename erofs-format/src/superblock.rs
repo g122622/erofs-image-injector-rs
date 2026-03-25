@@ -3,6 +3,7 @@
 //! The super block is located at offset 1024 and contains filesystem metadata.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::mem::size_of;
 
 /// EROFS super block (144 bytes)
@@ -105,7 +106,7 @@ pub struct ErofsSuperBlock {
 
 /// Union for rootnid and blocks_hi
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 pub union RootNidOrBlocksHi {
     /// Root directory nid (for 32-bit block addressing)
     pub rootnid_2b: u16,
@@ -113,14 +114,142 @@ pub union RootNidOrBlocksHi {
     pub blocks_hi: u16,
 }
 
+impl fmt::Debug for RootNidOrBlocksHi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.rootnid_2b };
+        f.debug_struct("RootNidOrBlocksHi")
+            .field("rootnid_2b", &val)
+            .finish()
+    }
+}
+
+impl Default for RootNidOrBlocksHi {
+    fn default() -> Self {
+        Self { rootnid_2b: 0 }
+    }
+}
+
+impl Serialize for RootNidOrBlocksHi {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for RootNidOrBlocksHi {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RootNidOrBlocksHiVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RootNidOrBlocksHiVisitor {
+            type Value = RootNidOrBlocksHi;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 2 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 2 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = RootNidOrBlocksHi::default();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut RootNidOrBlocksHi as *mut u8,
+                        2,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(RootNidOrBlocksHiVisitor)
+    }
+}
+
 /// Union for compression config
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 pub union SuperBlockU1 {
     /// Bitmap for available compression algorithms
     pub available_compr_algs: u16,
     /// Customized sliding window size (for LZ4)
     pub lz4_max_distance: u16,
+}
+
+impl fmt::Debug for SuperBlockU1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.available_compr_algs };
+        f.debug_struct("SuperBlockU1")
+            .field("available_compr_algs", &val)
+            .finish()
+    }
+}
+
+impl Default for SuperBlockU1 {
+    fn default() -> Self {
+        Self { available_compr_algs: 0 }
+    }
+}
+
+impl Serialize for SuperBlockU1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for SuperBlockU1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SuperBlockU1Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for SuperBlockU1Visitor {
+            type Value = SuperBlockU1;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 2 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 2 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = SuperBlockU1::default();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut SuperBlockU1 as *mut u8,
+                        2,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(SuperBlockU1Visitor)
+    }
 }
 
 // Compile-time size check
@@ -232,7 +361,7 @@ impl ErofsSuperBlock {
     /// Get root directory nid (handles both 32-bit and 48-bit modes)
     pub fn root_nid(&self) -> u64 {
         if self.has_incompat_feature(feature_incompat::BIT48) {
-            unsafe { self.rootnid_8b }
+            self.rootnid_8b
         } else {
             unsafe { self.rootnid_or_blocks_hi.rootnid_2b as u64 }
         }
@@ -277,7 +406,7 @@ impl Default for ErofsSuperBlock {
 
 /// Device slot entry (128 bytes)
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct ErofsDeviceSlot {
     /// Tag (digest, sha256, etc.)
     pub tag: [u8; 64],
@@ -293,16 +422,31 @@ pub struct ErofsDeviceSlot {
     pub reserved: [u8; 50],
 }
 
+impl Default for ErofsDeviceSlot {
+    fn default() -> Self {
+        Self {
+            tag: [0u8; 64],
+            blocks_lo: 0,
+            uniaddr_lo: 0,
+            blocks_hi: 0,
+            uniaddr_hi: 0,
+            reserved: [0u8; 50],
+        }
+    }
+}
+
 const _: () = assert!(size_of::<ErofsDeviceSlot>() == 128);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EROFS_SUPER_MAGIC_V1;
 
     #[test]
     fn test_super_block_defaults() {
         let sb = ErofsSuperBlock::new();
-        assert_eq!(sb.magic, EROFS_SUPER_MAGIC_V1);
+        let magic = sb.magic;
+        assert_eq!(magic, EROFS_SUPER_MAGIC_V1);
         assert_eq!(sb.block_size(), 4096);
         assert!(!sb.has_sb_chksum());
     }
@@ -317,8 +461,16 @@ mod tests {
         let bytes = sb.to_bytes();
         let parsed = ErofsSuperBlock::from_bytes(&bytes).expect("Should parse");
 
-        assert_eq!(parsed.magic, sb.magic);
-        assert_eq!(parsed.blocks_lo, sb.blocks_lo);
-        assert_eq!(parsed.meta_blkaddr, sb.meta_blkaddr);
+        // Copy values to avoid unaligned reference issues with packed structs
+        let parsed_magic = parsed.magic;
+        let parsed_blocks_lo = parsed.blocks_lo;
+        let parsed_meta_blkaddr = parsed.meta_blkaddr;
+        let sb_magic = sb.magic;
+        let sb_blocks_lo = sb.blocks_lo;
+        let sb_meta_blkaddr = sb.meta_blkaddr;
+
+        assert_eq!(parsed_magic, sb_magic);
+        assert_eq!(parsed_blocks_lo, sb_blocks_lo);
+        assert_eq!(parsed_meta_blkaddr, sb_meta_blkaddr);
     }
 }

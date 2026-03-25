@@ -3,15 +3,15 @@
 //! Custom LibAFL input type that represents an EROFS filesystem image
 //! with metadata about injection points for structure-aware mutations.
 
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 
 use libafl::inputs::Input;
-use libafl::state::HasMetadata;
+use libafl::corpus::CorpusId;
 use libafl_bolts::Error;
 use serde::{Deserialize, Serialize};
 
 use erofs_format::{
-    ErofsDataLayout, ErofsFileType, ErofsInodeCompact, ErofsInodeExtended, ErofsSuperBlock,
+    ErofsSuperBlock,
     EROFS_SUPER_OFFSET,
 };
 
@@ -31,6 +31,12 @@ pub struct ErofsImageInput {
     /// Cached root inode offset
     #[serde(skip)]
     root_inode_offset: Option<u64>,
+}
+
+impl Hash for ErofsImageInput {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.data.hash(state);
+    }
 }
 
 /// Injection point for mutations
@@ -96,7 +102,7 @@ pub enum InjectionPoint {
 }
 
 /// Super block fields that can be mutated
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum SuperblockField {
     /// Magic number
     Magic,
@@ -141,7 +147,7 @@ pub enum SuperblockField {
 }
 
 /// Inode fields that can be mutated
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum InodeField {
     /// Format flags
     Format,
@@ -170,7 +176,7 @@ pub enum InodeField {
 }
 
 /// Inode layout type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum InodeLayout {
     /// Compact 32-byte inode
     Compact,
@@ -179,7 +185,7 @@ pub enum InodeLayout {
 }
 
 /// Extended attribute type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum XattrType {
     /// Inline xattr
     Inline,
@@ -190,7 +196,7 @@ pub enum XattrType {
 }
 
 /// Compression type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum CompressionType {
     /// LZ4
     Lz4,
@@ -327,33 +333,6 @@ impl ErofsImageInput {
         self.injection_points.get(index)
     }
 
-    /// Get random injection point
-    pub fn random_injection_point(&self, rng: &mut impl libafl_bolts::rands::Rand) -> Option<&InjectionPoint> {
-        if self.injection_points.is_empty() {
-            return None;
-        }
-        let index = rng.below(self.injection_points.len() as u64) as usize;
-        self.injection_points.get(index)
-    }
-
-    /// Read bytes at offset
-    pub fn read_bytes(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
-        if offset + len > self.data.len() {
-            return None;
-        }
-        Some(self.data[offset..offset + len].to_vec())
-    }
-
-    /// Write bytes at offset
-    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) -> Result<(), Error> {
-        if offset + data.len() > self.data.len() {
-            return Err(Error::illegal_state("Write beyond image bounds"));
-        }
-        self.data[offset..offset + data.len()].copy_from_slice(data);
-        self.invalidate_cache();
-        Ok(())
-    }
-
     /// Invalidate cached parsed data
     fn invalidate_cache(&mut self) {
         self.super_block = None;
@@ -369,22 +348,11 @@ impl ErofsImageInput {
 }
 
 impl Input for ErofsImageInput {
-    fn generate_name(&self, idx: usize) -> String {
-        format!("erofs_input_{:06}", idx)
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        Ok(self.data.clone())
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        Ok(Self::new(bytes.to_vec()))
-    }
-
-    fn hashed(&self) -> u64 {
+    fn generate_name(&self, _idx: Option<CorpusId>) -> String {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash_slice(&self.data, &mut hasher);
-        hasher.finish()
+        let hash = hasher.finish();
+        format!("erofs_input_{:016x}", hash)
     }
 }
 
@@ -463,7 +431,7 @@ mod tests {
     #[test]
     fn test_input_from_bytes() {
         let data = vec![0u8; 1024 + std::mem::size_of::<ErofsSuperBlock>()];
-        let input = ErofsImageInput::from_bytes(&data).unwrap();
+        let input = ErofsImageInput::new(data.clone());
         assert_eq!(input.len(), data.len());
     }
 
@@ -475,8 +443,8 @@ mod tests {
         data[1024..1028].copy_from_slice(&magic);
 
         let input = ErofsImageInput::new(data.clone());
-        let bytes = input.to_bytes().unwrap();
-        let input2 = ErofsImageInput::from_bytes(&bytes).unwrap();
+        let bytes = input.data();
+        let input2 = ErofsImageInput::new(bytes.to_vec());
 
         assert_eq!(input.data(), input2.data());
     }
@@ -493,20 +461,27 @@ mod tests {
     }
 
     #[test]
-    fn test_read_write_bytes() {
-        let mut input = ErofsImageInput::new(vec![0u8; 100]);
-        input.write_bytes(10, &[1, 2, 3, 4]).unwrap();
-        let read = input.read_bytes(10, 4).unwrap();
-        assert_eq!(read, vec![1, 2, 3, 4]);
-    }
+    fn test_hash() {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
 
-    #[test]
-    fn test_ensure_size() {
-        let mut input = ErofsImageInput::new(vec![0u8; 100]);
-        input.ensure_size(200);
-        assert_eq!(input.len(), 200);
+        let input1 = ErofsImageInput::new(vec![1, 2, 3, 4]);
+        let input2 = ErofsImageInput::new(vec![1, 2, 3, 4]);
+        let input3 = ErofsImageInput::new(vec![4, 3, 2, 1]);
 
-        input.ensure_size(50);
-        assert_eq!(input.len(), 200); // Should not shrink
+        let mut hasher1 = DefaultHasher::new();
+        input1.hash(&mut hasher1);
+        let hash1 = hasher1.finish();
+
+        let mut hasher2 = DefaultHasher::new();
+        input2.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
+
+        let mut hasher3 = DefaultHasher::new();
+        input3.hash(&mut hasher3);
+        let hash3 = hasher3.finish();
+
+        assert_eq!(hash1, hash2);
+        assert_ne!(hash1, hash3);
     }
 }

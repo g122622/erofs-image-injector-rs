@@ -2,38 +2,23 @@
 //!
 //! Core fuzzing loop and orchestration.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::num::NonZeroUsize;
 
-use libafl::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus};
-use libafl::events::SimpleEventManager;
-use libafl::feedback_and_fast, feedback_or;
-use libafl::feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback};
-use libafl::fuzzer::{Fuzzer, StdFuzzer};
-use libafl::inputs::Input;
-use libafl::monitors::SimpleMonitor;
-use libafl::mutators::{HavocScheduledMutator, havoc_mutations};
-use libafl::observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver};
-use libafl::schedulers::QueueScheduler;
-use libafl::stages::mutational::StdMutationalStage;
-use libafl::state::{HasCorpus, StdState};
+use libafl::corpus::{Corpus, InMemoryCorpus, Testcase};
+use libafl::mutators::Mutator;
+use libafl::state::{HasCorpus, HasRand};
 use libafl_bolts::current_nanos;
-use libafl_bolts::rands::StdRand;
-use libafl_bolts::shmem::{ShMem, ShMemProvider, UnixShMemProvider};
-use libafl_bolts::tuples::tuple_list;
-use tracing::{debug, error, info, warn};
+use libafl_bolts::rands::{Rand, StdRand};
+use tracing::{debug, info, warn};
 
 use erofs_input::ErofsImageInput;
 use erofs_mutator::{
     ErofsBitflipMutator, ErofsDirectoryMutator, ErofsInodeMutator, ErofsSuperblockMutator,
-    ErofsXattrMutator,
+    ErofsXattrMutator, rand_below,
 };
 
-use crate::cli::CliArgs;
+use crate::cli::{CliArgs, FuzzerConfig};
 use crate::executor::{ErofsfuseExecutor, ErofsfuseExit};
-
-pub use crate::cli::FuzzerConfig;
 
 /// Fuzzer error types
 #[derive(Debug, thiserror::Error)]
@@ -41,10 +26,6 @@ pub enum FuzzerError {
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    /// LibAFL error
-    #[error("LibAFL error: {0}")]
-    LibAfl(#[from] libafl_bolts::Error),
 
     /// No seeds found
     #[error("No seed images found in {0}")]
@@ -77,155 +58,26 @@ pub fn run_fuzzer(args: CliArgs) -> FuzzerResult<()> {
     std::fs::create_dir_all(&config.corpus_dir)?;
     std::fs::create_dir_all(&config.mount_base)?;
 
-    // Initialize the fuzzer components
-    let monitor = SimpleMonitor::new(|s| info!("{}", s));
-
-    // Create the event manager
-    let mut mgr = SimpleEventManager::new(monitor);
-
-    // Create the corpus
-    let mut corpus = InMemoryCorpus::new();
-
-    // Create solutions corpus (crashes)
-    let solutions = OnDiskCorpus::new(&config.output_dir)?;
-
-    // Create the feedback
-    let time_observer = TimeObserver::new("time");
-
-    // Create feedback to rate inputs
-    let mut feedback = feedback_or!(
-        TimeFeedback::new(&time_observer),
-    );
-
-    // Objective: we want crashes
-    let mut objective = CrashFeedback::new();
-
-    // Create state
-    let mut state = StdState::new(
-        StdRand::with_seed(current_nanos()),
-        corpus,
-        solutions,
-        &mut feedback,
-        &mut objective,
-    )?;
+    // Create state with randomness
+    let mut state = SimpleFuzzerState::new(current_nanos());
 
     // Load seeds
     load_seeds(&mut state, &config)?;
 
     // Check if we have any seeds
-    if state.corpus().count() == 0 {
+    if state.corpus_count == 0 {
         return Err(FuzzerError::NoSeeds(config.seeds_dir.display().to_string()));
     }
 
-    info!("Loaded {} seeds", state.corpus().count());
+    info!("Loaded {} seeds", state.corpus_count);
 
-    // Create mutators
-    let mutators = tuple_list!(
-        ErofsSuperblockMutator::new(),
-        ErofsInodeMutator::new(),
-        ErofsDirectoryMutator::new(),
-        ErofsXattrMutator::new(),
-        ErofsBitflipMutator::new(),
-    );
-
-    let mutator_scheduler = HavocScheduledMutator::new(mutators);
-
-    // Create stages
-    let mut stages = tuple_list!(
-        StdMutationalStage::new(mutator_scheduler)
-    );
-
-    // Create scheduler
-    let scheduler = QueueScheduler::new();
-
-    // Create fuzzer
-    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-
-    // Create executor
-    let executor = ErofsfuseExecutor::new(&config);
-
-    // Run the fuzzing loop
+    // Run the simple fuzzer loop (without coverage for now)
     info!("Starting fuzzing loop...");
 
-    let max_iterations = config.max_iterations;
-    let mut iterations = 0;
+    run_simple_fuzzer(&config, &mut state)?;
 
-    loop {
-        // Check iteration limit
-        if max_iterations > 0 && iterations >= max_iterations {
-            info!("Reached max iterations: {}", max_iterations);
-            break;
-        }
-
-        // Get next input from corpus
-        let corpus_id = match fuzzer.schedule(&state) {
-            Some(id) => id,
-            None => {
-                warn!("No inputs in corpus");
-                break;
-            }
-        };
-
-        // Get the input
-        let input = state.corpus().get(corpus_id)?.borrow().input().cloned();
-
-        if let Some(input) = input {
-            let input = if let Some(input) = input.as_any().downcast_ref::<ErofsImageInput>() {
-                input.clone()
-            } else {
-                warn!("Input is not ErofsImageInput");
-                continue;
-            };
-
-            // Execute
-            let exit_kind = execute_input(&executor, &input)?;
-
-            // Check for crash
-            match exit_kind {
-                ErofsfuseExit::Crashed(signal) => {
-                    info!("Found crash with signal {}!", signal);
-
-                    // Save crash
-                    let crash_path = config.output_dir.join(format!(
-                        "crash-{:016x}-signal-{}.erofs",
-                        current_nanos(),
-                        signal
-                    ));
-                    std::fs::write(&crash_path, input.data())?;
-                    info!("Crash saved to {:?}", crash_path);
-                }
-                ErofsfuseExit::Timeout => {
-                    debug!("Execution timeout");
-                }
-                ErofsfuseExit::Error(code) => {
-                    debug!("Execution error: {}", code);
-                }
-                ErofsfuseExit::Success | ErofsfuseExit::FailedToStart => {
-                    // Normal execution
-                }
-            }
-
-            iterations += 1;
-
-            if iterations % 100 == 0 {
-                info!("Iterations: {}", iterations);
-            }
-        }
-
-        // Mutate and add to corpus
-        let mut new_input = state.corpus().get(corpus_id)?.borrow().input().cloned().unwrap();
-        // Note: In a real implementation, we would apply mutations here
-    }
-
-    info!("Fuzzing completed. Total iterations: {}", iterations);
+    info!("Fuzzing completed");
     Ok(())
-}
-
-/// Execute an input and return the exit kind
-fn execute_input(executor: &ErofsfuseExecutor, input: &ErofsImageInput) -> FuzzerResult<ErofsfuseExit> {
-    // This is a simplified version - in practice, we'd integrate with LibAFL's executor framework
-    let mut executor = executor.clone();
-    executor.execute(input).map_err(|e| FuzzerError::Executor(e.to_string()))
 }
 
 /// Validate the fuzzer configuration
@@ -263,11 +115,37 @@ fn validate_config(config: &FuzzerConfig) -> FuzzerResult<()> {
     Ok(())
 }
 
+/// Simple fuzzer state that holds seeds and random generator
+struct SimpleFuzzerState {
+    rand: StdRand,
+    seeds: Vec<ErofsImageInput>,
+    corpus_count: usize,
+}
+
+impl SimpleFuzzerState {
+    fn new(seed: u64) -> Self {
+        Self {
+            rand: StdRand::with_seed(seed),
+            seeds: Vec::new(),
+            corpus_count: 0,
+        }
+    }
+}
+
+impl HasRand for SimpleFuzzerState {
+    type Rand = StdRand;
+
+    fn rand(&self) -> &Self::Rand {
+        &self.rand
+    }
+
+    fn rand_mut(&mut self) -> &mut Self::Rand {
+        &mut self.rand
+    }
+}
+
 /// Load seed images from the seeds directory
-fn load_seeds<S>(state: &mut StdState<ErofsImageInput, S>, config: &FuzzerConfig) -> FuzzerResult<()>
-where
-    S: libafl::state::HasCorpus + libafl::state::HasRand,
-{
+fn load_seeds(state: &mut SimpleFuzzerState, config: &FuzzerConfig) -> FuzzerResult<()> {
     info!("Loading seeds from {:?}", config.seeds_dir);
 
     let mut count = 0;
@@ -284,7 +162,7 @@ where
                 match std::fs::read(&path) {
                     Ok(data) => {
                         let input = ErofsImageInput::new(data);
-                        state.corpus_mut().add(input)?;
+                        state.seeds.push(input);
                         count += 1;
                         debug!("Loaded seed: {:?}", path);
                     }
@@ -296,159 +174,124 @@ where
         }
     }
 
+    state.corpus_count = count;
     info!("Loaded {} seed images", count);
     Ok(())
 }
 
-/// Simple fuzzer for testing without full LibAFL integration
-pub struct SimpleFuzzer {
-    /// Configuration
-    config: FuzzerConfig,
+/// Simple fuzzer implementation without coverage-guided feedback
+fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> FuzzerResult<()> {
+    let mut executor = ErofsfuseExecutor::new(config);
+    let mut iterations = 0u64;
+    let mut crashes = 0u64;
 
-    /// Seeds
-    seeds: Vec<ErofsImageInput>,
+    let mut bitflip_mutator = ErofsBitflipMutator::new();
+    let mut sb_mutator = ErofsSuperblockMutator::new();
+    let mut inode_mutator = ErofsInodeMutator::new();
+    let mut dir_mutator = ErofsDirectoryMutator::new();
+    let mut xattr_mutator = ErofsXattrMutator::new();
 
-    /// Crashes found
-    crashes: Vec<ErofsImageInput>,
-
-    /// Iterations completed
-    iterations: u64,
-}
-
-impl SimpleFuzzer {
-    /// Create a new simple fuzzer
-    pub fn new(config: FuzzerConfig) -> Self {
-        Self {
-            config,
-            seeds: Vec::new(),
-            crashes: Vec::new(),
-            iterations: 0,
+    loop {
+        // Check iteration limit
+        if config.max_iterations > 0 && iterations >= config.max_iterations {
+            info!("Reached max iterations: {}", config.max_iterations);
+            break;
         }
-    }
 
-    /// Load seeds
-    pub fn load_seeds(&mut self) -> FuzzerResult<()> {
-        let entries = std::fs::read_dir(&self.config.seeds_dir)?;
+        // Get a random seed from corpus
+        if state.seeds.is_empty() {
+            warn!("Corpus is empty");
+            break;
+        }
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let data = std::fs::read(&path)?;
-                self.seeds.push(ErofsImageInput::new(data));
+        let seed_idx = state.rand.below(NonZeroUsize::new(state.seeds.len()).unwrap());
+
+        // Get the input from corpus
+        let input = state.seeds[seed_idx].clone();
+
+        // Clone and mutate
+        let mut mutated_input = input.clone();
+
+        // Apply multiple mutations
+        let num_mutations = 1 + rand_below(state.rand_mut(), config.mutations_per_input);
+        for _ in 0..num_mutations {
+            let mutation_choice = rand_below(state.rand_mut(), 5);
+            let _ = match mutation_choice {
+                0 => bitflip_mutator.mutate(state, &mut mutated_input),
+                1 => sb_mutator.mutate(state, &mut mutated_input),
+                2 => inode_mutator.mutate(state, &mut mutated_input),
+                3 => dir_mutator.mutate(state, &mut mutated_input),
+                4 => xattr_mutator.mutate(state, &mut mutated_input),
+                _ => bitflip_mutator.mutate(state, &mut mutated_input),
+            };
+        }
+
+        // Execute
+        match executor.execute(&mutated_input) {
+            Ok(ErofsfuseExit::Crashed(signal)) => {
+                info!("Found crash with signal {}!", signal);
+                crashes += 1;
+
+                // Save crash
+                let crash_path = config.output_dir.join(format!(
+                    "crash-{:016x}-signal-{}.erofs",
+                    current_nanos(),
+                    signal
+                ));
+                std::fs::write(&crash_path, mutated_input.data())?;
+                info!("Crash saved to {:?}", crash_path);
+
+                // Also save crash info
+                let info_path = config.output_dir.join(format!(
+                    "crash-{:016x}-signal-{}.log",
+                    current_nanos(),
+                    signal
+                ));
+                let info = format!(
+                    "Signal: {}\nIteration: {}\nSize: {} bytes\n",
+                    signal,
+                    iterations,
+                    mutated_input.len()
+                );
+                let _ = std::fs::write(&info_path, info);
+            }
+            Ok(ErofsfuseExit::Timeout) => {
+                debug!("Execution timeout");
+            }
+            Ok(ErofsfuseExit::Error(code)) => {
+                debug!("Execution error: {}", code);
+            }
+            Ok(ErofsfuseExit::Success) => {
+                // Normal execution - could add to corpus if interesting
+            }
+            Ok(ErofsfuseExit::FailedToStart) => {
+                debug!("Failed to start erofsfuse");
+            }
+            Err(e) => {
+                debug!("Execution error: {}", e);
             }
         }
 
-        info!("Loaded {} seeds", self.seeds.len());
-        Ok(())
-    }
+        iterations += 1;
 
-    /// Run the fuzzer
-    pub fn run(&mut self) -> FuzzerResult<()> {
-        if self.seeds.is_empty() {
-            return Err(FuzzerError::NoSeeds(self.config.seeds_dir.display().to_string()));
-        }
-
-        let mut executor = ErofsfuseExecutor::new(&self.config);
-        let mut rng = StdRand::with_seed(current_nanos());
-        let mut bitflip_mutator = ErofsBitflipMutator::new();
-        let mut sb_mutator = ErofsSuperblockMutator::new();
-
-        std::fs::create_dir_all(&self.config.output_dir)?;
-
-        loop {
-            // Check iteration limit
-            if self.config.max_iterations > 0 && self.iterations >= self.config.max_iterations {
-                info!("Reached max iterations: {}", self.config.max_iterations);
-                break;
-            }
-
-            // Pick a random seed
-            let seed_idx = rng.below(self.seeds.len() as u64) as usize;
-            let mut input = self.seeds[seed_idx].clone();
-
-            // Mutate
-            let _ = bitflip_mutator.mutate(&mut rng, &mut input);
-            let _ = sb_mutator.mutate(&mut rng, &mut input);
-
-            // Execute
-            match executor.execute(&input) {
-                Ok(ErofsfuseExit::Crashed(signal)) => {
-                    info!("Found crash with signal {}!", signal);
-
-                    // Save crash
-                    let crash_path = self.config.output_dir.join(format!(
-                        "crash-{:016x}-signal-{}.erofs",
-                        current_nanos(),
-                        signal
-                    ));
-                    std::fs::write(&crash_path, input.data())?;
-                    self.crashes.push(input);
-                }
-                Ok(ErofsfuseExit::Success) => {
-                    // Could add to corpus if interesting
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    debug!("Execution error: {}", e);
-                }
-            }
-
-            self.iterations += 1;
-
-            if self.iterations % 100 == 0 {
-                info!("Iterations: {}, Crashes: {}", self.iterations, self.crashes.len());
-            }
-        }
-
-        info!("Fuzzing completed. Total crashes: {}", self.crashes.len());
-        Ok(())
-    }
-
-    /// Get crashes
-    pub fn crashes(&self) -> &[ErofsImageInput] {
-        &self.crashes
-    }
-
-    /// Get iterations
-    pub fn iterations(&self) -> u64 {
-        self.iterations
-    }
-}
-
-impl Clone for ErofsfuseExecutor {
-    fn clone(&self) -> Self {
-        Self {
-            erofsfuse_path: self.erofsfuse_path.clone(),
-            mount_base: self.mount_base.clone(),
-            timeout: self.timeout,
-            max_size: self.max_size,
-            min_size: self.min_size,
-            keep_temp: self.keep_temp,
-            executions: 0,
+        if iterations % 100 == 0 {
+            info!("Iterations: {}, Crashes: {}, Corpus: {}",
+                  iterations, crashes, state.seeds.len());
         }
     }
-}
 
-impl libafl::state::HasRand for StdRand {
-    type Rand = StdRand;
-
-    fn rand(&self) -> &Self::Rand {
-        self
-    }
-
-    fn rand_mut(&mut self) -> &mut Self::Rand {
-        self
-    }
+    info!("Fuzzing finished. Total iterations: {}, Total crashes: {}", iterations, crashes);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use clap::Parser;
 
     #[test]
     fn test_config_validation() {
-        let config = FuzzerConfig::from(CliArgs::parse_from(["test", "--seeds", "/nonexistent"]));
+        let config = FuzzerConfig::from(CliArgs::try_parse_from(["test", "--seeds", "/nonexistent"]).unwrap());
         let result = validate_config(&config);
         assert!(result.is_err());
     }

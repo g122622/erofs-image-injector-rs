@@ -10,7 +10,9 @@ pub enum ErofsError {
     /// Invalid magic number
     #[error("Invalid EROFS magic number: expected {expected:#x}, got {actual:#x}")]
     InvalidMagic {
+        /// Expected magic value
         expected: u32,
+        /// Actual magic value found
         actual: u32,
     },
 
@@ -25,19 +27,23 @@ pub enum ErofsError {
     /// Invalid checksum
     #[error("Checksum mismatch: expected {expected:#x}, got {actual:#x}")]
     ChecksumMismatch {
+        /// Expected checksum
         expected: u32,
+        /// Actual checksum found
         actual: u32,
     },
 
     /// Invalid inode
     #[error("Invalid inode at offset {offset:#x}")]
     InvalidInode {
+        /// Offset of the invalid inode
         offset: u64,
     },
 
     /// Invalid directory entry
     #[error("Invalid directory entry at offset {offset:#x}")]
     InvalidDirent {
+        /// Offset of the invalid dirent
         offset: u64,
     },
 

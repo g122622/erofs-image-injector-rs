@@ -38,7 +38,7 @@ pub const EROFS_XATTR_FILTER_SEED: u32 = 0x25BBE08F;
 ///
 /// Inline xattrs start with this header followed by shared xattr indices.
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ErofsXattrIbodyHeader {
     /// Bit value 1 indicates not-present
     pub h_name_filter: u32,
@@ -53,7 +53,7 @@ const _: () = assert!(size_of::<ErofsXattrIbodyHeader>() == 12);
 
 /// Xattr entry (4 bytes + name + value)
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ErofsXattrEntry {
     /// Length of name
     pub e_name_len: u8,
@@ -77,14 +77,20 @@ pub struct ErofsXattrLongPrefix {
     pub infix: [u8; 0], // Flexible array
 }
 
-impl ErofsXattrIbodyHeader {
-    /// Create a new inline xattr header
-    pub fn new() -> Self {
+impl Default for ErofsXattrIbodyHeader {
+    fn default() -> Self {
         Self {
             h_name_filter: EROFS_XATTR_FILTER_DEFAULT,
             h_shared_count: 0,
             h_reserved2: [0u8; 7],
         }
+    }
+}
+
+impl ErofsXattrIbodyHeader {
+    /// Create a new inline xattr header
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Calculate inline xattr size
@@ -118,9 +124,13 @@ impl ErofsXattrIbodyHeader {
     }
 }
 
-impl Default for ErofsXattrIbodyHeader {
+impl Default for ErofsXattrEntry {
     fn default() -> Self {
-        Self::new()
+        Self {
+            e_name_len: 0,
+            e_name_index: 0,
+            e_value_size: 0,
+        }
     }
 }
 
@@ -130,7 +140,7 @@ impl ErofsXattrEntry {
         Self {
             e_name_len: name.len() as u8,
             e_name_index: name_index,
-            e_value_size,
+            e_value_size: value_size,
         }
     }
 
@@ -170,16 +180,6 @@ impl ErofsXattrEntry {
             );
         }
         bytes
-    }
-}
-
-impl Default for ErofsXattrEntry {
-    fn default() -> Self {
-        Self {
-            e_name_len: 0,
-            e_name_index: 0,
-            e_value_size: 0,
-        }
     }
 }
 

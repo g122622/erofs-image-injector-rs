@@ -2,14 +2,15 @@
 //!
 //! Simple bit-flip mutation strategy that operates on raw bytes.
 
+use libafl::corpus::CorpusId;
 use libafl::mutators::{Mutator, MutationResult};
-use libafl::state::HasMetadata;
+use libafl::state::HasRand;
+use libafl_bolts::Named;
 use libafl_bolts::rands::Rand;
 use libafl_bolts::Error;
+use std::borrow::Cow;
 
-use crate::{
-    arithmetic_mutate, flip_random_bit, interesting_value_mutate, rand_in_range, set_random_bytes,
-};
+use crate::{rand_below, flip_random_bit, set_random_bytes, arithmetic_mutate, interesting_value_mutate};
 use erofs_input::ErofsImageInput;
 
 /// Bitflip mutator for EROFS images
@@ -39,7 +40,7 @@ impl ErofsBitflipMutator {
             return MutationResult::Skipped;
         }
 
-        let mutation_type = rng.below(6);
+        let mutation_type = rand_below(rng, 6);
 
         match mutation_type {
             0 => {
@@ -49,7 +50,7 @@ impl ErofsBitflipMutator {
             }
             1 => {
                 // Multiple bit flips
-                let count = 1 + rng.below(4);
+                let count = 1 + rand_below(rng, 4);
                 for _ in 0..count {
                     flip_random_bit(data, rng);
                 }
@@ -57,15 +58,15 @@ impl ErofsBitflipMutator {
             }
             2 => {
                 // Random bytes
-                let offset = rng.below(data.len() as u64) as usize;
-                let len = std::cmp::min(1 + rng.below(8) as usize, data.len() - offset);
+                let offset = rand_below(rng, data.len());
+                let len = std::cmp::min(1 + rand_below(rng, 8), data.len() - offset);
                 set_random_bytes(&mut data[offset..offset + len], rng);
                 MutationResult::Mutated
             }
             3 => {
                 // Arithmetic mutation
-                let offset = rng.below(data.len() as u64) as usize;
-                let len = std::cmp::min(1 + rng.below(4) as usize, data.len() - offset);
+                let offset = rand_below(rng, data.len());
+                let len = std::cmp::min(1 + rand_below(rng, 4), data.len() - offset);
                 for _ in 0..len {
                     arithmetic_mutate(&mut data[offset..], rng);
                 }
@@ -74,9 +75,9 @@ impl ErofsBitflipMutator {
             4 => {
                 // Interesting value
                 let sizes = [1, 2, 4, 8];
-                let size = sizes[rng.below(sizes.len() as u64) as usize];
+                let size = sizes[rand_below(rng, sizes.len())];
                 if data.len() >= size {
-                    let offset = rng.below((data.len() - size + 1) as u64) as usize;
+                    let offset = rand_below(rng, data.len() - size + 1);
                     interesting_value_mutate(&mut data[offset..offset + size], rng, size);
                     MutationResult::Mutated
                 } else {
@@ -85,10 +86,10 @@ impl ErofsBitflipMutator {
             }
             5 => {
                 // Block deletion/insertion (rare)
-                let offset = rng.below(data.len() as u64) as usize;
+                let offset = rand_below(rng, data.len());
                 let max_block = std::cmp::min(64, data.len() - offset);
                 if max_block > 0 {
-                    let block_size = 1 + rng.below(max_block as u64) as usize;
+                    let block_size = 1 + rand_below(rng, max_block);
                     // Overwrite with zeros or duplicate adjacent
                     if offset + block_size < data.len() {
                         data[offset..offset + block_size].fill(0);
@@ -103,9 +104,16 @@ impl ErofsBitflipMutator {
     }
 }
 
+impl Named for ErofsBitflipMutator {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("ErofsBitflipMutator");
+        &NAME
+    }
+}
+
 impl<S> Mutator<ErofsImageInput, S> for ErofsBitflipMutator
 where
-    S: HasMetadata,
+    S: HasRand,
 {
     fn mutate(
         &mut self,
@@ -122,7 +130,7 @@ where
         // Apply multiple mutations
         let mut result = MutationResult::Skipped;
         for _ in 0..self.max_mutations {
-            if rng.below(3) == 0 {
+            if rand_below(rng, 3) == 0 {
                 // 1/3 chance to apply mutation
                 let mutation_result = self.mutate_data(data, rng);
                 if mutation_result == MutationResult::Mutated {
@@ -132,6 +140,10 @@ where
         }
 
         Ok(result)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -152,9 +164,7 @@ mod tests {
         }
     }
 
-    impl HasMetadata for TestState {}
-
-    impl libafl::state::UsesRand for TestState {
+    impl HasRand for TestState {
         type Rand = StdRand;
 
         fn rand(&self) -> &Self::Rand {

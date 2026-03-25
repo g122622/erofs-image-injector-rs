@@ -3,6 +3,7 @@
 //! Inodes contain file/directory metadata and data location information.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::mem::size_of;
 
 /// Inode data layout types
@@ -65,7 +66,7 @@ impl Default for ErofsInodeLayout {
 
 /// Union for inode i_nb field
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 pub union InodeNb {
     /// nlink count (if NLINK_1_BIT is unset)
     pub nlink: u16,
@@ -75,9 +76,83 @@ pub union InodeNb {
     pub startblk_hi: u16,
 }
 
+impl fmt::Debug for InodeNb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.nlink };
+        f.debug_struct("InodeNb")
+            .field("nlink", &val)
+            .finish()
+    }
+}
+
+impl Default for InodeNb {
+    fn default() -> Self {
+        Self { nlink: 0 }
+    }
+}
+
+impl Serialize for InodeNb {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for InodeNb {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct InodeNbVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InodeNbVisitor {
+            type Value = InodeNb;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 2 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 2 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = InodeNb::default();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut InodeNb as *mut u8,
+                        2,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(InodeNbVisitor)
+    }
+}
+
+/// Chunk info for chunk-based inodes
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct InodeChunkInfo {
+    /// Format (chunk blkbits, indexes flag, 48-bit flag)
+    pub format: u16,
+    /// Reserved
+    pub reserved: u16,
+}
+
 /// Union for inode i_u field
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 pub union InodeU {
     /// Total blocks (for compressed inodes)
     pub blocks_lo: u32,
@@ -89,14 +164,68 @@ pub union InodeU {
     pub chunk_info: InodeChunkInfo,
 }
 
-/// Chunk info for chunk-based inodes
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct InodeChunkInfo {
-    /// Format (chunk blkbits, indexes flag, 48-bit flag)
-    pub format: u16,
-    /// Reserved
-    pub reserved: u16,
+impl fmt::Debug for InodeU {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let val = unsafe { self.blocks_lo };
+        f.debug_struct("InodeU")
+            .field("blocks_lo", &val)
+            .finish()
+    }
+}
+
+impl Default for InodeU {
+    fn default() -> Self {
+        Self { blocks_lo: 0 }
+    }
+}
+
+impl Serialize for InodeU {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+        };
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for InodeU {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct InodeUVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InodeUVisitor {
+            type Value = InodeU;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a byte array of 4 bytes")
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if bytes.len() != 4 {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let mut val = InodeU::default();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut val as *mut InodeU as *mut u8,
+                        4,
+                    );
+                }
+                Ok(val)
+            }
+        }
+
+        deserializer.deserialize_bytes(InodeUVisitor)
+    }
 }
 
 /// Compact inode (32 bytes)
@@ -390,9 +519,19 @@ mod tests {
         let bytes = inode.to_bytes();
         let parsed = ErofsInodeCompact::from_bytes(&bytes).expect("Should parse");
 
-        assert_eq!(parsed.i_mode, inode.i_mode);
-        assert_eq!(parsed.i_size, inode.i_size);
-        assert_eq!(parsed.i_uid, inode.i_uid);
-        assert_eq!(parsed.i_gid, inode.i_gid);
+        // Copy values to avoid unaligned reference issues with packed structs
+        let parsed_mode = parsed.i_mode;
+        let parsed_size = parsed.i_size;
+        let parsed_uid = parsed.i_uid;
+        let parsed_gid = parsed.i_gid;
+        let inode_mode = inode.i_mode;
+        let inode_size = inode.i_size;
+        let inode_uid = inode.i_uid;
+        let inode_gid = inode.i_gid;
+
+        assert_eq!(parsed_mode, inode_mode);
+        assert_eq!(parsed_size, inode_size);
+        assert_eq!(parsed_uid, inode_uid);
+        assert_eq!(parsed_gid, inode_gid);
     }
 }

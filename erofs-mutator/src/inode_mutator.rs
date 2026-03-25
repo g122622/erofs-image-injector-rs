@@ -2,13 +2,16 @@
 //!
 //! Structure-aware mutations targeting EROFS inode structures.
 
+use libafl::corpus::CorpusId;
 use libafl::mutators::{Mutator, MutationResult};
-use libafl::state::HasMetadata;
+use libafl::state::HasRand;
+use libafl_bolts::Named;
 use libafl_bolts::rands::Rand;
 use libafl_bolts::Error;
+use std::borrow::Cow;
 use tracing::{debug, trace};
 
-use crate::{arithmetic_mutate, interesting_value_mutate, set_random_bytes};
+use crate::{rand_below, arithmetic_mutate, interesting_value_mutate, set_random_bytes};
 use erofs_format::{inode_format, ErofsDataLayout, ErofsInodeCompact, ErofsInodeExtended, EROFS_SUPER_OFFSET};
 use erofs_input::{ErofsImageInput, InodeField, InodeLayout};
 
@@ -24,6 +27,13 @@ pub struct ErofsInodeMutator {
 impl Default for ErofsInodeMutator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Named for ErofsInodeMutator {
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("ErofsInodeMutator");
+        &NAME
     }
 }
 
@@ -70,7 +80,7 @@ impl ErofsInodeMutator {
             InodeField::Gid,
         ];
 
-        fields[rng.below(fields.len() as u64) as usize]
+        fields[rand_below(rng, fields.len())]
     }
 
     /// Mutate a specific inode field
@@ -85,7 +95,7 @@ impl ErofsInodeMutator {
         match field {
             InodeField::Format => {
                 // i_format (u16 at offset 0)
-                let mutation_type = rng.below(4);
+                let mutation_type = rand_below(rng, 4);
                 match mutation_type {
                     0 => {
                         // Set to specific layout
@@ -96,19 +106,19 @@ impl ErofsInodeMutator {
                             ErofsDataLayout::CompressedCompact as u16,
                             ErofsDataLayout::ChunkBased as u16,
                         ];
-                        let layout_val = layouts[rng.below(layouts.len() as u64) as usize];
+                        let layout_val = layouts[rand_below(rng, layouts.len())];
                         let format = (layout_val << inode_format::DATALAYOUT_BIT)
-                            | (rng.below(2) as u16); // version bit
+                            | (rand_below(rng, 2) as u16); // version bit
                         data[offset..offset + 2].copy_from_slice(&format.to_le_bytes());
                     }
                     1 => {
                         // Invalid layout
-                        let invalid_layout = 5 + (rng.below(8) as u16);
+                        let invalid_layout = 5 + (rand_below(rng, 8) as u16);
                         data[offset..offset + 2].copy_from_slice(&(invalid_layout << 1).to_le_bytes());
                     }
                     2 => {
                         // Bit flip
-                        data[offset] ^= 1 << (rng.below(8) as u8);
+                        data[offset] ^= 1 << (rand_below(rng, 8) as u8);
                     }
                     _ => {
                         // Random
@@ -121,7 +131,7 @@ impl ErofsInodeMutator {
             InodeField::XattrIcount => {
                 // i_xattr_icount (u16 at offset 2)
                 let xattr_offset = offset + 2;
-                let mutation_type = rng.below(3);
+                let mutation_type = rand_below(rng, 3);
                 match mutation_type {
                     0 => data[xattr_offset..xattr_offset + 2].fill(0),
                     1 => data[xattr_offset..xattr_offset + 2].fill(0xFF),
@@ -132,7 +142,7 @@ impl ErofsInodeMutator {
             InodeField::Mode => {
                 // i_mode (u16 at offset 4)
                 let mode_offset = offset + 4;
-                let mode_type = rng.below(5);
+                let mode_type = rand_below(rng, 5);
                 match mode_type {
                     0 => {
                         // Set to directory
@@ -189,21 +199,22 @@ impl ErofsInodeMutator {
                 // i_u union (u32 at offset 16)
                 let u_offset = offset + 16;
                 // This could be blocks, startblk, or rdev
-                let mutation_type = rng.below(3);
+                let mutation_type = rand_below(rng, 3);
                 match mutation_type {
                     0 => {
                         // Zero (invalid block)
                         data[u_offset..u_offset + 4].fill(0);
+                        MutationResult::Mutated
                     }
                     1 => {
                         // Large value (out of bounds)
                         data[u_offset..u_offset + 4].fill(0xFF);
+                        MutationResult::Mutated
                     }
                     _ => {
                         self.mutate_32bit(&mut data[u_offset..u_offset + 4], rng)
                     }
                 }
-                MutationResult::Mutated
             }
             InodeField::Ino => {
                 // i_ino (u32 at offset 20 for compact)
@@ -266,7 +277,7 @@ impl ErofsInodeMutator {
 
     /// Mutate a 16-bit field
     fn mutate_16bit<R: Rand>(&self, data: &mut [u8], rng: &mut R) -> MutationResult {
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
         match mutation_type {
             0 => data.fill(0),
             1 => data.fill(0xFF),
@@ -278,7 +289,7 @@ impl ErofsInodeMutator {
 
     /// Mutate a 32-bit field
     fn mutate_32bit<R: Rand>(&self, data: &mut [u8], rng: &mut R) -> MutationResult {
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
         match mutation_type {
             0 => data.fill(0),
             1 => data.fill(0xFF),
@@ -290,7 +301,7 @@ impl ErofsInodeMutator {
 
     /// Mutate a 64-bit field
     fn mutate_64bit<R: Rand>(&self, data: &mut [u8], rng: &mut R) -> MutationResult {
-        let mutation_type = rng.below(4);
+        let mutation_type = rand_below(rng, 4);
         match mutation_type {
             0 => data.fill(0),
             1 => data.fill(0xFF),
@@ -303,7 +314,7 @@ impl ErofsInodeMutator {
 
 impl<S> Mutator<ErofsImageInput, S> for ErofsInodeMutator
 where
-    S: HasMetadata,
+    S: HasRand,
 {
     fn mutate(
         &mut self,
@@ -311,15 +322,8 @@ where
         input: &mut ErofsImageInput,
     ) -> Result<MutationResult, Error> {
         let rng = state.rand_mut();
-        let data = input.data_mut();
 
-        // Check minimum size
-        if data.len() < self.min_size {
-            trace!("Image too small for inode mutation");
-            return Ok(MutationResult::Skipped);
-        }
-
-        // Find inode locations from injection points
+        // Find inode locations from injection points first (before getting mutable data)
         let inode_offsets: Vec<(usize, InodeLayout)> = input
             .injection_points()
             .iter()
@@ -339,8 +343,16 @@ where
             return Ok(MutationResult::Skipped);
         }
 
+        let data = input.data_mut();
+
+        // Check minimum size
+        if data.len() < self.min_size {
+            trace!("Image too small for inode mutation");
+            return Ok(MutationResult::Skipped);
+        }
+
         // Select a random inode to mutate
-        let (offset, layout) = inode_offsets[rng.below(inode_offsets.len() as u64) as usize];
+        let (offset, layout) = inode_offsets[rand_below(rng, inode_offsets.len())];
         trace!("Mutating inode at offset {:#x}", offset);
 
         let result = self.mutate_inode_at(data, offset, layout, rng);
@@ -350,6 +362,10 @@ where
         }
 
         Ok(result)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -370,9 +386,7 @@ mod tests {
         }
     }
 
-    impl HasMetadata for TestState {}
-
-    impl libafl::state::UsesRand for TestState {
+    impl HasRand for TestState {
         type Rand = StdRand;
 
         fn rand(&self) -> &Self::Rand {
