@@ -11,12 +11,16 @@ mod superblock_mutator;
 mod inode_mutator;
 mod directory_mutator;
 mod xattr_mutator;
+mod field_locator;
+mod targeted_mutator;
 
 pub use bitflip_mutator::*;
 pub use superblock_mutator::*;
 pub use inode_mutator::*;
 pub use directory_mutator::*;
 pub use xattr_mutator::*;
+pub use field_locator::*;
+pub use targeted_mutator::*;
 
 use libafl_bolts::rands::Rand;
 use std::num::NonZeroUsize;

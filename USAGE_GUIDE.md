@@ -880,5 +880,242 @@ tracing = "0.1"        # 日志
 
 ---
 
-*文档版本：1.0*
-*最后更新：2026-03-25*
+*文档版本：1.1*
+*最后更新：2026-03-27*
+
+## 精准注入模式
+
+精准注入模式允许您精确控制变异的位置和范围，而不是随机进行模糊测试。
+
+### 基本用法
+
+```bash
+# 精准变异 superblock.checksum 字段
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --target superblock.checksum \
+    --strategy bitflip \
+    --iterations 10000
+
+# 精准变异 superblock.checksum 字段及其后 4 字节
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --target superblock.checksum \
+    --after 4 \
+    --strategy boundary
+
+# 精准变异绝对偏移范围
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --range 1028:16 \
+    --strategy zero
+
+# 仅使用精准变异（跳过随机变异）
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --target inode.i_size \
+    --targeted
+```
+
+### 支持的目标字段
+
+**超级块字段**：
+- `superblock.magic` - 魔数
+- `superblock.checksum` - 校验和
+- `superblock.blkszbits` - 块大小位数
+- `superblock.rootnid` - 根目录 NID
+- `superblock.meta_blkaddr` - 元数据块地址
+- `superblock.feature_compat` / `feature_incompat` - 特性标志
+
+**inode 字段**：
+- `inode.i_format` - 格式标志
+- `inode.i_mode` - 文件模式
+- `inode.i_size` - 文件大小
+- `inode.i_uid` / `i_gid` - 用户/组 ID
+
+### 变异策略
+
+| 策略 | 说明 |
+|------|------|
+| `bitflip` | 翻转随机位（默认） |
+| `arithmetic` | 算术变异（加减小值） |
+| `interesting` | 使用边界值（0, max, min 等） |
+| `boundary` | 使用预定义边界值 |
+| `random` | 随机字节 |
+| `zero` | 填充 0x00 |
+| `max` | 填充 0xFF |
+
+### 高级示例
+
+```bash
+# 针对 superblock.meta_blkaddr 字段进行边界值测试
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --target superblock.meta_blkaddr \
+    --before 2 --after 2 \
+    --strategy boundary \
+    --count 5 \
+    --iterations 50000
+
+# 针对 inode.i_format 字段进行算术变异
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --target inode.i_format \
+    --strategy arithmetic \
+    --targeted
+```
+
+---
+
+## 内核态测试
+
+内核态测试允许直接测试 Linux 内核的 EROFS 驱动，而不是用户态的 erofsfuse。
+
+### 环境搭建
+
+#### 1. 构建测试内核
+
+```bash
+# 构建带 EROFS 支持和调试选项的内核
+./scripts/build_kernel.sh
+
+# 或指定版本
+KERNEL_VERSION=6.9 ./scripts/build_kernel.sh
+```
+
+这会：
+- 下载 Linux 内核源码
+- 配置 EROFS 和调试选项（KASAN、KCOV 等）
+- 编译内核 (bzImage)
+- 创建最小根文件系统 (rootfs.cpio.gz)
+
+#### 2. 验证构建
+
+```bash
+# 检查生成的文件
+ls -la kernel_build/
+
+# 应该看到:
+# - bzImage       (内核镜像)
+# - rootfs.cpio.gz (根文件系统)
+```
+
+### 使用 QEMU 测试
+
+#### 手动测试单个镜像
+
+```bash
+# 测试单个 EROFS 镜像
+./scripts/run_qemu_test.sh ./seeds/test.erofs
+
+# 指定自定义参数
+KERNEL=./kernel_build/bzImage \
+ROOTFS=./kernel_build/rootfs.cpio.gz \
+MEMORY=1024 \
+TIMEOUT=120 \
+./scripts/run_qemu_test.sh ./crashes/crash-xxx.erofs
+
+# 启用调试输出
+./scripts/run_qemu_test.sh ./test.erofs --debug
+```
+
+#### 检测结果
+
+脚本会自动检测以下内核问题：
+- **Kernel Panic** - 内核崩溃
+- **Kernel Oops** - 内核错误
+- **EROFS Error** - EROFS 相关错误
+- **Call Trace** - 调用栈追踪
+
+### 内核测试要求
+
+测试内核包含以下调试选项：
+
+| 选项 | 说明 |
+|------|------|
+| `CONFIG_EROFS_FS` | EROFS 文件系统支持 |
+| `CONFIG_EROFS_FS_DEBUG` | EROFS 调试输出 |
+| `CONFIG_EROFS_FS_ZIP` | EROFS 压缩支持 |
+| `CONFIG_KASAN` | 内核地址消毒器 |
+| `CONFIG_KCOV` | 代码覆盖率 |
+| `CONFIG_DEBUG_INFO` | 调试符号 |
+| `CONFIG_LOCKDEP` | 锁依赖检测 |
+
+### 自动化内核测试
+
+```bash
+# 批量测试崩溃样本
+for crash in ./crashes/*.erofs; do
+    echo "Testing: $crash"
+    ./scripts/run_qemu_test.sh "$crash" --timeout 30
+done
+```
+
+### 与 Fuzzer 集成
+
+内核执行器已集成到框架中：
+
+```rust
+use erofs_fuzzer::{QemuKernelExecutor, ExecutorConfig, Executor};
+
+// 创建 QEMU 内核执行器
+let config = ExecutorConfig::qemu(
+    PathBuf::from("./kernel_build/bzImage"),
+    PathBuf::from("./kernel_build/rootfs.cpio.gz"),
+    60000, // 60秒超时
+);
+
+let mut executor = QemuKernelExecutor::new(&config);
+
+// 执行测试
+let result = executor.execute(&input)?;
+if result.is_crash() {
+    println!("Kernel crash detected!");
+}
+```
+
+### 内核崩溃分析
+
+崩溃输出示例：
+
+```
+==============================================
+QEMU EROFS Test
+==============================================
+Kernel:     ./kernel_build/bzImage
+Rootfs:     ./kernel_build/rootfs.cpio.gz
+Image:      ./crashes/crash-xxx.erofs
+Memory:     512MB
+Timeout:    60s
+==============================================
+
+[    2.345678] Kernel panic - not syncing: EROFS: invalid superblock
+[    2.345679] Call Trace:
+[    2.345680]  erofs_read_superblock+0x150/0x200
+[    2.345681]  erofs_fc_fill_super+0x50/0x300
+[    2.345682]  get_tree_bdev+0x100/0x200
+
+==============================================
+Result: KERNEL PANIC DETECTED
+```
+
+### 常见内核问题
+
+1. **EROFS 超级块验证失败**
+   - magic number 错误
+   - 校验和不匹配
+   - 块大小无效
+
+2. **内存访问错误**
+   - KASAN 检测到越界访问
+   - 空指针解引用
+   - 释放后使用
+
+3. **压缩数据处理**
+   - LZ4 解压错误
+   - 压缩块边界问题
+
+---
+
+*文档版本：1.2*
+*最后更新：2026-03-27*

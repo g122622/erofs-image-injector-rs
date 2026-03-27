@@ -6,8 +6,10 @@
 #![deny(missing_docs)]
 
 mod erofs_input;
+mod targeted_mutation;
 
 pub use erofs_input::*;
+pub use targeted_mutation::*;
 
 // Re-export commonly used types from LibAFL
 pub use libafl::inputs::Input;

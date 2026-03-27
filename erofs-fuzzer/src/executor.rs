@@ -8,7 +8,7 @@
 //! - Uses aggressive process monitoring during filesystem operations
 //! - Detects crashes that happen in FUSE worker threads
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +20,8 @@ use tracing::{debug, error, info, trace, warn};
 use libafl_bolts::Error;
 
 use erofs_input::ErofsImageInput;
-
 use crate::cli::FuzzerConfig;
+use crate::executor_trait::{Executor, ExecutionResult};
 
 /// Exit kind for erofsfuse execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +134,8 @@ impl ErofsfuseExecutor {
         self.executions
     }
 
-    /// Execute the target with the given input
-    pub fn execute(&mut self, input: &ErofsImageInput) -> Result<ErofsfuseExit, Error> {
+    /// Execute the target with the given input (returns ErofsfuseExit)
+    pub fn execute_erofs(&mut self, input: &ErofsImageInput) -> Result<ErofsfuseExit, Error> {
         self.executions += 1;
 
         let data = input.data();
@@ -745,5 +745,34 @@ mod tests {
         assert_eq!(EXIT_SIGSEGV, 139);
         assert_eq!(EXIT_SIGFPE, 136);
         assert_eq!(EXIT_SIGBUS, 135);
+    }
+}
+
+/// Convert ErofsfuseExit to ExecutionResult
+impl From<ErofsfuseExit> for ExecutionResult {
+    fn from(exit: ErofsfuseExit) -> Self {
+        match exit {
+            ErofsfuseExit::Success => ExecutionResult::Success,
+            ErofsfuseExit::Timeout => ExecutionResult::Timeout,
+            ErofsfuseExit::Crashed(signal) => ExecutionResult::Crashed(signal),
+            ErofsfuseExit::Error(code) => ExecutionResult::Error(code),
+            ErofsfuseExit::FailedToStart => ExecutionResult::FailedToStart,
+            ErofsfuseExit::AsanError => ExecutionResult::AsanError,
+        }
+    }
+}
+
+/// Implement Executor trait for ErofsfuseExecutor
+impl Executor for ErofsfuseExecutor {
+    fn execute(&mut self, input: &ErofsImageInput) -> Result<ExecutionResult, Error> {
+        self.execute_erofs(input).map(|exit| exit.into())
+    }
+
+    fn executions(&self) -> u64 {
+        self.executions
+    }
+
+    fn name(&self) -> &'static str {
+        "ErofsfuseExecutor"
     }
 }

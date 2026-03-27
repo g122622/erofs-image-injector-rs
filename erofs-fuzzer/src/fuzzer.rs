@@ -4,17 +4,19 @@
 
 use std::num::NonZeroUsize;
 
-use libafl::corpus::{Corpus, InMemoryCorpus, Testcase};
 use libafl::mutators::Mutator;
-use libafl::state::{HasCorpus, HasRand};
+use libafl::state::HasRand;
 use libafl_bolts::current_nanos;
 use libafl_bolts::rands::{Rand, StdRand};
 use tracing::{debug, info, warn};
 
-use erofs_input::ErofsImageInput;
+use erofs_input::{
+    ErofsImageInput, MutationStrategy, MutationTarget,
+    parse_target,
+};
 use erofs_mutator::{
     ErofsBitflipMutator, ErofsDirectoryMutator, ErofsInodeMutator, ErofsSuperblockMutator,
-    ErofsXattrMutator, rand_below,
+    ErofsXattrMutator, TargetedMutator, rand_below,
 };
 
 use crate::cli::{CliArgs, FuzzerConfig};
@@ -179,6 +181,51 @@ fn load_seeds(state: &mut SimpleFuzzerState, config: &FuzzerConfig) -> FuzzerRes
     Ok(())
 }
 
+/// Create a targeted mutator from configuration
+fn create_targeted_mutator(config: &FuzzerConfig) -> Option<TargetedMutator> {
+    let tc = config.targeted_config.as_ref()?;
+
+    // Parse strategy
+    let strategy = MutationStrategy::from_str(&tc.strategy)
+        .unwrap_or_else(|_| MutationStrategy::BitFlip { count: 1 });
+
+    // Parse target
+    let target = if let Some(target_str) = &tc.target {
+        // Field targeting
+        parse_target(target_str).ok()?
+    } else if let Some(range_str) = &tc.range {
+        // Range targeting
+        let parts: Vec<&str> = range_str.split(':').collect();
+        if parts.len() != 2 {
+            warn!("Invalid range format: {}. Expected start:length", range_str);
+            return None;
+        }
+        let start = parts[0].parse::<usize>().ok()?;
+        let length = parts[1].parse::<usize>().ok()?;
+        MutationTarget::AbsoluteRange { start, length }
+    } else {
+        warn!("No target or range specified for targeted mutation");
+        return None;
+    };
+
+    // Apply before/after offsets if targeting a field
+    let target = match target {
+        MutationTarget::FieldRange { field, offset_before: _, offset_after: _ } => {
+            MutationTarget::FieldRange {
+                field,
+                offset_before: tc.before,
+                offset_after: tc.after,
+            }
+        }
+        other => other,
+    };
+
+    let mut mutator = TargetedMutator::new(target, strategy);
+    mutator = mutator.with_max_mutations(tc.count);
+
+    Some(mutator)
+}
+
 /// Simple fuzzer implementation without coverage-guided feedback
 fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> FuzzerResult<()> {
     let mut executor = ErofsfuseExecutor::new(config);
@@ -191,11 +238,21 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
     let mut dir_mutator = ErofsDirectoryMutator::new();
     let mut xattr_mutator = ErofsXattrMutator::new();
 
+    // Create targeted mutator if configured
+    let mut targeted_mutator = create_targeted_mutator(config);
+
+    if targeted_mutator.is_some() {
+        info!("Targeted mutation mode enabled");
+        if let Some(ref tc) = config.targeted_config {
+            info!("Target config: {:?}", tc);
+        }
+    }
+
     // First, test all seeds without mutation to find existing crashes
     info!("Testing {} seed images without mutation...", state.seeds.len());
     for (idx, seed) in state.seeds.iter().enumerate() {
         info!("Testing seed {} of {}", idx + 1, state.seeds.len());
-        match executor.execute(seed) {
+        match executor.execute_erofs(seed) {
             Ok(ErofsfuseExit::Crashed(signal)) => {
                 info!("Found crash in seed with signal {}!", signal);
                 crashes += 1;
@@ -294,22 +351,41 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
         // Clone and mutate
         let mut mutated_input = input.clone();
 
-        // Apply multiple mutations
-        let num_mutations = 1 + rand_below(state.rand_mut(), config.mutations_per_input);
-        for _ in 0..num_mutations {
-            let mutation_choice = rand_below(state.rand_mut(), 5);
-            let _ = match mutation_choice {
-                0 => bitflip_mutator.mutate(state, &mut mutated_input),
-                1 => sb_mutator.mutate(state, &mut mutated_input),
-                2 => inode_mutator.mutate(state, &mut mutated_input),
-                3 => dir_mutator.mutate(state, &mut mutated_input),
-                4 => xattr_mutator.mutate(state, &mut mutated_input),
-                _ => bitflip_mutator.mutate(state, &mut mutated_input),
-            };
+        // Apply mutations
+        if config.targeted_only {
+            // Targeted-only mode: only use targeted mutator
+            if let Some(ref mut tm) = targeted_mutator {
+                for _ in 0..config.mutations_per_input {
+                    let _ = tm.mutate(state, &mut mutated_input);
+                }
+            }
+        } else {
+            // Mixed mode: combine targeted mutations with random mutations
+            let num_mutations = 1 + rand_below(state.rand_mut(), config.mutations_per_input);
+            for _ in 0..num_mutations {
+                // Use targeted mutator if available, with 30% probability
+                if let Some(ref mut tm) = targeted_mutator {
+                    if rand_below(state.rand_mut(), 10) < 3 {
+                        let _ = tm.mutate(state, &mut mutated_input);
+                        continue;
+                    }
+                }
+
+                // Otherwise use random mutators
+                let mutation_choice = rand_below(state.rand_mut(), 5);
+                let _ = match mutation_choice {
+                    0 => bitflip_mutator.mutate(state, &mut mutated_input),
+                    1 => sb_mutator.mutate(state, &mut mutated_input),
+                    2 => inode_mutator.mutate(state, &mut mutated_input),
+                    3 => dir_mutator.mutate(state, &mut mutated_input),
+                    4 => xattr_mutator.mutate(state, &mut mutated_input),
+                    _ => bitflip_mutator.mutate(state, &mut mutated_input),
+                };
+            }
         }
 
         // Execute
-        match executor.execute(&mutated_input) {
+        match executor.execute_erofs(&mutated_input) {
             Ok(ErofsfuseExit::Crashed(signal)) => {
                 info!("Found crash with signal {}!", signal);
                 crashes += 1;

@@ -68,6 +68,36 @@ pub struct CliArgs {
     /// Enable verbose output
     #[arg(short, long)]
     pub verbose: bool,
+
+    // ===== Targeted Mutation Arguments =====
+
+    /// Target field for precise mutation (format: struct.field, e.g., superblock.checksum)
+    #[arg(long, value_name = "FIELD")]
+    pub target: Option<String>,
+
+    /// Absolute byte range to mutate (format: start:length, e.g., 1024:8)
+    #[arg(long, value_name = "RANGE")]
+    pub range: Option<String>,
+
+    /// Bytes before the target field to include in mutation
+    #[arg(long, default_value = "0")]
+    pub before: usize,
+
+    /// Bytes after the target field to include in mutation
+    #[arg(long, default_value = "0")]
+    pub after: usize,
+
+    /// Mutation strategy: bitflip, arithmetic, interesting, boundary, random, zero, max
+    #[arg(long, default_value = "bitflip")]
+    pub strategy: String,
+
+    /// Number of mutations to apply in targeted mode
+    #[arg(long, default_value = "1")]
+    pub count: usize,
+
+    /// Enable targeted-only mode (skip random mutations, only use targeted mutations)
+    #[arg(long)]
+    pub targeted: bool,
 }
 
 /// Configuration derived from CLI arguments
@@ -97,10 +127,44 @@ pub struct FuzzerConfig {
     pub mutations_per_input: usize,
     /// ASan enabled
     pub asan_enabled: bool,
+    /// Targeted mutation configuration
+    pub targeted_config: Option<TargetedConfig>,
+    /// Targeted-only mode (skip random mutations)
+    pub targeted_only: bool,
+}
+
+/// Configuration for targeted mutation
+#[derive(Debug, Clone)]
+pub struct TargetedConfig {
+    /// Target field specification (if using field targeting)
+    pub target: Option<String>,
+    /// Absolute range (if using range targeting)
+    pub range: Option<String>,
+    /// Bytes before target field
+    pub before: usize,
+    /// Bytes after target field
+    pub after: usize,
+    /// Mutation strategy
+    pub strategy: String,
+    /// Number of mutations
+    pub count: usize,
 }
 
 impl From<CliArgs> for FuzzerConfig {
     fn from(args: CliArgs) -> Self {
+        let targeted_config = if args.target.is_some() || args.range.is_some() {
+            Some(TargetedConfig {
+                target: args.target,
+                range: args.range,
+                before: args.before,
+                after: args.after,
+                strategy: args.strategy,
+                count: args.count,
+            })
+        } else {
+            None
+        };
+
         Self {
             seeds_dir: args.seeds,
             output_dir: args.output,
@@ -114,6 +178,8 @@ impl From<CliArgs> for FuzzerConfig {
             min_image_size: args.min_size,
             mutations_per_input: args.mutations_per_input,
             asan_enabled: args.asan,
+            targeted_config,
+            targeted_only: args.targeted,
         }
     }
 }
@@ -128,5 +194,31 @@ mod tests {
         assert_eq!(args.output, PathBuf::from("./crashes"));
         assert_eq!(args.timeout, 60);
         assert_eq!(args.workers, 1);
+    }
+
+    #[test]
+    fn test_targeted_args() {
+        let args = CliArgs::parse_from([
+            "test", "--seeds", "./seeds",
+            "--target", "superblock.checksum",
+            "--after", "4",
+            "--strategy", "bitflip",
+            "--count", "3",
+        ]);
+        assert_eq!(args.target, Some("superblock.checksum".to_string()));
+        assert_eq!(args.after, 4);
+        assert_eq!(args.strategy, "bitflip");
+        assert_eq!(args.count, 3);
+    }
+
+    #[test]
+    fn test_range_targeting() {
+        let args = CliArgs::parse_from([
+            "test", "--seeds", "./seeds",
+            "--range", "1024:8",
+            "--strategy", "zero",
+        ]);
+        assert_eq!(args.range, Some("1024:8".to_string()));
+        assert_eq!(args.strategy, "zero");
     }
 }
