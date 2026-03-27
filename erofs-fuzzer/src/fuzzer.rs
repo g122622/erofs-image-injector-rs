@@ -191,6 +191,88 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
     let mut dir_mutator = ErofsDirectoryMutator::new();
     let mut xattr_mutator = ErofsXattrMutator::new();
 
+    // First, test all seeds without mutation to find existing crashes
+    info!("Testing {} seed images without mutation...", state.seeds.len());
+    for (idx, seed) in state.seeds.iter().enumerate() {
+        info!("Testing seed {} of {}", idx + 1, state.seeds.len());
+        match executor.execute(seed) {
+            Ok(ErofsfuseExit::Crashed(signal)) => {
+                info!("Found crash in seed with signal {}!", signal);
+                crashes += 1;
+
+                // Save crash
+                let crash_path = config.output_dir.join(format!(
+                    "seed-crash-{:016x}-signal-{}.erofs",
+                    current_nanos(),
+                    signal
+                ));
+                std::fs::write(&crash_path, seed.data())?;
+                info!("Crash saved to {:?}", crash_path);
+
+                // Also save crash info
+                let info_path = config.output_dir.join(format!(
+                    "seed-crash-{:016x}-signal-{}.log",
+                    current_nanos(),
+                    signal
+                ));
+                let info = format!(
+                    "Signal: {}\nIteration: 0 (seed)\nSize: {} bytes\nSeed index: {}\n",
+                    signal,
+                    seed.len(),
+                    idx
+                );
+                let _ = std::fs::write(&info_path, info);
+            }
+            Ok(ErofsfuseExit::AsanError) => {
+                info!("Found ASan error in seed!");
+                crashes += 1;
+
+                let crash_path = config.output_dir.join(format!(
+                    "seed-crash-{:016x}-asan.erofs",
+                    current_nanos()
+                ));
+                std::fs::write(&crash_path, seed.data())?;
+                info!("ASan crash saved to {:?}", crash_path);
+
+                let info_path = config.output_dir.join(format!(
+                    "seed-crash-{:016x}-asan.log",
+                    current_nanos()
+                ));
+                let info = format!(
+                    "Type: AddressSanitizer Error\nIteration: 0 (seed)\nSize: {} bytes\nSeed index: {}\n",
+                    seed.len(),
+                    idx
+                );
+                let _ = std::fs::write(&info_path, info);
+            }
+            Ok(ErofsfuseExit::Timeout) => {
+                debug!("Seed execution timeout");
+            }
+            Ok(ErofsfuseExit::Error(code)) => {
+                // Check for ASan-related exit codes
+                if code == 134 {
+                    info!("Found ASan crash in seed (exit code 134)!");
+                    crashes += 1;
+
+                    let crash_path = config.output_dir.join(format!(
+                        "seed-crash-{:016x}-asan.erofs",
+                        current_nanos()
+                    ));
+                    std::fs::write(&crash_path, seed.data())?;
+                    info!("Crash saved to {:?}", crash_path);
+                }
+            }
+            Ok(_) => {
+                // Normal execution
+            }
+            Err(e) => {
+                debug!("Seed execution error: {}", e);
+            }
+        }
+    }
+
+    info!("Starting mutation-based fuzzing...");
+
     loop {
         // Check iteration limit
         if config.max_iterations > 0 && iterations >= config.max_iterations {
@@ -255,10 +337,57 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
                 );
                 let _ = std::fs::write(&info_path, info);
             }
+            Ok(ErofsfuseExit::AsanError) => {
+                info!("Found ASan memory error!");
+                crashes += 1;
+
+                // Save crash
+                let crash_path = config.output_dir.join(format!(
+                    "crash-{:016x}-asan.erofs",
+                    current_nanos()
+                ));
+                std::fs::write(&crash_path, mutated_input.data())?;
+                info!("ASan crash saved to {:?}", crash_path);
+
+                // Also save crash info
+                let info_path = config.output_dir.join(format!(
+                    "crash-{:016x}-asan.log",
+                    current_nanos()
+                ));
+                let info = format!(
+                    "Type: AddressSanitizer Error\nIteration: {}\nSize: {} bytes\n",
+                    iterations,
+                    mutated_input.len()
+                );
+                let _ = std::fs::write(&info_path, info);
+            }
             Ok(ErofsfuseExit::Timeout) => {
                 debug!("Execution timeout");
             }
             Ok(ErofsfuseExit::Error(code)) => {
+                // Check for ASan-related exit codes (134 = 128 + 6 = SIGABRT)
+                if code == 134 {
+                    info!("Found ASan crash (exit code 134)!");
+                    crashes += 1;
+
+                    let crash_path = config.output_dir.join(format!(
+                        "crash-{:016x}-asan.erofs",
+                        current_nanos()
+                    ));
+                    std::fs::write(&crash_path, mutated_input.data())?;
+                    info!("Crash saved to {:?}", crash_path);
+
+                    let info_path = config.output_dir.join(format!(
+                        "crash-{:016x}-asan.log",
+                        current_nanos()
+                    ));
+                    let info = format!(
+                        "ASan crash (exit code 134)\nIteration: {}\nSize: {} bytes\n",
+                        iterations,
+                        mutated_input.len()
+                    );
+                    let _ = std::fs::write(&info_path, info);
+                }
                 debug!("Execution error: {}", code);
             }
             Ok(ErofsfuseExit::Success) => {

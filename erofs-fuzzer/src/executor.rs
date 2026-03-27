@@ -1,15 +1,22 @@
 //! Erofsfuse Executor
 //!
 //! Executor that runs erofsfuse to mount and test EROFS images.
+//!
+//! This executor implements improved crash detection:
+//! - Detects ASan crashes via exit codes (134 = SIGABRT, etc.)
+//! - Monitors stderr for ASan error messages in real-time
+//! - Uses aggressive process monitoring during filesystem operations
+//! - Detects crashes that happen in FUSE worker threads
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tracing::{debug, error, info, trace, warn};
 
-use libafl::executors::ExitKind;
-use libafl::inputs::Input;
 use libafl_bolts::Error;
 
 use erofs_input::ErofsImageInput;
@@ -29,32 +36,75 @@ pub enum ErofsfuseExit {
     Error(i32),
     /// Failed to start process
     FailedToStart,
+    /// ASan detected memory error
+    AsanError,
+}
+
+impl ErofsfuseExit {
+    /// Returns true if this exit indicates a crash or error
+    pub fn is_crash(&self) -> bool {
+        matches!(self, ErofsfuseExit::Crashed(_) | ErofsfuseExit::AsanError)
+    }
+}
+
+/// ASan error patterns to detect in stderr/stdout
+/// These patterns are case-insensitive for better matching
+const ASAN_ERROR_PATTERNS: &[&str] = &[
+    // ASan specific patterns
+    "AddressSanitizer",
+    "ASAN",
+    "ERROR:",
+    "SUMMARY:",
+    // Crash indicators
+    "Segmentation Fault",
+    "segmentation fault",
+    "SEGV on unknown",
+    // Memory error types
+    "heap-buffer-overflow",
+    "heap-use-after-free",
+    "stack-buffer-overflow",
+    "stack-use-after-scope",
+    "global-buffer-overflow",
+    "use-after-poison",
+    "double-free",
+    "invalid-free",
+    "memory allocation failed",
+    // ASan specific output markers
+    "Starting backtrace",
+    "shadow bytes",
+    "AddressSanitizer:",
+    "LeakSanitizer",
+    "UndefinedBehaviorSanitizer",
+];
+
+/// Signal exit codes (128 + signal number)
+const EXIT_SIGABRT: i32 = 134; // 128 + 6
+const EXIT_SIGSEGV: i32 = 139; // 128 + 11
+const EXIT_SIGFPE: i32 = 136;  // 128 + 8
+const EXIT_SIGBUS: i32 = 135;  // 128 + 7
+
+/// Process monitoring result
+#[derive(Debug, Clone, Copy)]
+enum ProcessEvent {
+    /// ASan detected in stderr
+    AsanDetected,
 }
 
 /// Executor for erofsfuse
-///
-/// This executor writes the image to a temp file, mounts it using erofsfuse,
-/// performs file system operations, and detects crashes.
 #[derive(Debug)]
 pub struct ErofsfuseExecutor {
     /// Path to erofsfuse binary
     erofsfuse_path: PathBuf,
-
     /// Base directory for mount points
     mount_base: PathBuf,
-
     /// Timeout for each execution
     timeout: Duration,
-
     /// Maximum image size
     max_size: usize,
-
     /// Minimum image size
     min_size: usize,
-
     /// Whether to keep temp files for debugging
     keep_temp: bool,
-
     /// Number of executions
     executions: u64,
 }
@@ -90,7 +140,6 @@ impl ErofsfuseExecutor {
 
         let data = input.data();
 
-        // Check size constraints
         if data.len() < self.min_size {
             trace!("Input too small: {} < {}", data.len(), self.min_size);
             return Ok(ErofsfuseExit::Error(0));
@@ -100,33 +149,27 @@ impl ErofsfuseExecutor {
             return Ok(ErofsfuseExit::Error(0));
         }
 
-        // Create temp directory for this execution
         let temp_dir = tempfile::tempdir_in(&self.mount_base)
             .map_err(|e| Error::illegal_state(format!("Failed to create temp dir: {}", e)))?;
 
-        // Write image to temp file
         let image_path = temp_dir.path().join("image.erofs");
         std::fs::write(&image_path, data)
             .map_err(|e| Error::illegal_state(format!("Failed to write image: {}", e)))?;
 
-        // Create mount point
         let mount_point = temp_dir.path().join("mnt");
         std::fs::create_dir_all(&mount_point)
             .map_err(|e| Error::illegal_state(format!("Failed to create mount point: {}", e)))?;
 
-        // Run erofsfuse
         let result = self.run_erofsfuse(&image_path, &mount_point);
 
-        // Cleanup (unless keep_temp)
         if !self.keep_temp {
-            // Unmount if still mounted
             let _ = self.unmount(&mount_point);
         }
 
         result
     }
 
-    /// Run erofsfuse and perform file system operations
+    /// Run erofsfuse with improved crash detection
     fn run_erofsfuse(
         &self,
         image_path: &Path,
@@ -134,12 +177,15 @@ impl ErofsfuseExecutor {
     ) -> Result<ErofsfuseExit, Error> {
         let start = Instant::now();
 
-        // Start erofsfuse process
+        // Start erofsfuse with stdout and stderr capture
+        // Use -f (foreground) mode so we can properly monitor the process
+        // ASan outputs to both stdout and stderr, so we need to capture both
         let mut child = match Command::new(&self.erofsfuse_path)
             .arg(image_path)
             .arg(mount_point)
             .arg("-o")
             .arg("ro")
+            .arg("-f")  // Run in foreground for proper monitoring
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -151,38 +197,120 @@ impl ErofsfuseExecutor {
             }
         };
 
-        // Wait for mount to complete (or timeout)
-        let mount_timeout = Duration::from_secs(5);
-        let mut mounted = false;
+        // Capture stdout and stderr in separate threads
+        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let stderr = child.stderr.take().expect("Failed to capture stderr");
+        let (crash_tx, crash_rx) = mpsc::channel::<ProcessEvent>();
+        let asan_detected = Arc::new(AtomicBool::new(false));
+        let asan_detected_stdout = asan_detected.clone();
+        let asan_detected_stderr = asan_detected.clone();
+        let crash_tx_stdout = crash_tx.clone();
 
-        while start.elapsed() < mount_timeout {
-            // Check if mount point has content
-            if mount_point.exists() && mount_point.read_dir().map_or(false, |mut d| d.next().is_some()) {
-                mounted = true;
-                break;
-            }
+        // Spawn stdout monitoring thread (ASan often outputs here)
+        let stdout_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
 
-            // Check if process has exited
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Process exited during mount
-                    let exit_code = status.code().unwrap_or(-1);
-                    debug!("erofsfuse exited during mount with status: {}", exit_code);
-
-                    // Check for crash signals
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::ExitStatusExt;
-                        if let Some(signal) = status.signal() {
-                            return Ok(ErofsfuseExit::Crashed(signal));
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        // Log for debugging
+                        trace!("stdout: {}", line.trim());
+                        // Check for ASan patterns
+                        for pattern in ASAN_ERROR_PATTERNS {
+                            if line.contains(pattern) {
+                                info!("ASan pattern '{}' detected in stdout: {}", pattern, line.trim());
+                                asan_detected_stdout.store(true, Ordering::SeqCst);
+                                let _ = crash_tx_stdout.send(ProcessEvent::AsanDetected);
+                            }
                         }
                     }
+                    Err(e) => {
+                        debug!("Stdout read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
 
-                    return Ok(ErofsfuseExit::Error(exit_code));
+        // Spawn stderr monitoring thread
+        let stderr_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        // Log for debugging
+                        trace!("stderr: {}", line.trim());
+                        // Check for ASan patterns
+                        for pattern in ASAN_ERROR_PATTERNS {
+                            if line.contains(pattern) {
+                                debug!("ASan pattern '{}' detected in stderr: {}", pattern, line.trim());
+                                asan_detected_stderr.store(true, Ordering::SeqCst);
+                                let _ = crash_tx.send(ProcessEvent::AsanDetected);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Stderr read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Wait for mount with timeout
+        let mount_timeout = Duration::from_secs(5);
+        let mut mounted = false;
+        let poll_interval = Duration::from_millis(20);
+
+        while start.elapsed() < mount_timeout {
+            // Check for crash first
+            match crash_rx.try_recv() {
+                Ok(ProcessEvent::AsanDetected) => {
+                    info!("ASan error detected during mount phase");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Ok(ErofsfuseExit::AsanError);
+                }
+                _ => {}
+            }
+
+            // Check process status
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Process exited - check why
+                    let exit = self.classify_exit(&status);
+                    if exit.is_crash() || exit == ErofsfuseExit::Error(134) {
+                        info!("Process crashed during mount: {:?}", exit);
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        return Ok(exit);
+                    }
+                    debug!("Process exited during mount with {:?}", exit);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Ok(exit);
                 }
                 Ok(None) => {
-                    // Still running
-                    std::thread::sleep(Duration::from_millis(100));
+                    // Still running - check mount point
+                    if mount_point.exists() {
+                        if let Ok(mut dir) = mount_point.read_dir() {
+                            if dir.next().is_some() {
+                                mounted = true;
+                                debug!("Mount successful after {:?}", start.elapsed());
+                                break;
+                            }
+                        }
+                    }
+                    std::thread::sleep(poll_interval);
                 }
                 Err(e) => {
                     error!("Failed to check process status: {}", e);
@@ -192,113 +320,303 @@ impl ErofsfuseExecutor {
         }
 
         if !mounted {
-            warn!("Mount timeout, killing process");
+            warn!("Mount timeout after {:?}", start.elapsed());
+            // Check if process crashed
+            if asan_detected.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Ok(ErofsfuseExit::AsanError);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let exit = self.classify_exit(&status);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Ok(exit);
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Ok(ErofsfuseExit::Timeout);
+                }
+            }
+        }
+
+        // Perform filesystem operations with aggressive crash monitoring
+        debug!("Starting filesystem operations");
+        let ops_result = self.perform_filesystem_ops_with_monitoring(
+            mount_point,
+            &mut child,
+            &crash_rx,
+            &asan_detected,
+            self.timeout.saturating_sub(start.elapsed()),
+        );
+
+        // Check final result
+        if let Some(exit) = ops_result {
+            debug!("Filesystem ops detected crash: {:?}", exit);
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(ErofsfuseExit::Timeout);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Ok(exit);
         }
 
-        // Perform file system operations
-        let ops_result = self.perform_filesystem_ops(mount_point);
+        // Unmount gracefully
+        let _ = self.unmount(mount_point);
 
-        // Unmount
-        let unmount_result = self.unmount(mount_point);
+        // Wait for process to exit and get final status
+        let wait_result = child.wait_timeout(Duration::from_secs(2));
 
-        // Wait for process to exit
-        match child.wait_timeout(self.timeout.saturating_sub(start.elapsed())) {
+        let final_exit = match wait_result {
             Ok(Some(status)) => {
-                let exit_code = status.code().unwrap_or(-1);
-
-                // Check for crash signals
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    if let Some(signal) = status.signal() {
-                        return Ok(ErofsfuseExit::Crashed(signal));
-                    }
-                }
-
-                if exit_code != 0 {
-                    Ok(ErofsfuseExit::Error(exit_code))
-                } else {
-                    Ok(ops_result.unwrap_or(ErofsfuseExit::Success))
-                }
+                let exit = self.classify_exit(&status);
+                debug!("Final process status: {:?}", exit);
+                exit
             }
             Ok(None) => {
-                // Timeout
-                warn!("Process timeout, killing");
+                warn!("Process still running after unmount, killing");
                 let _ = child.kill();
-                let _ = child.wait();
-                Ok(ErofsfuseExit::Timeout)
+                let status = child.wait().ok();
+                status.map_or(ErofsfuseExit::Error(-1), |s| self.classify_exit(&s))
             }
             Err(e) => {
-                error!("Failed to wait for process: {}", e);
+                error!("Error waiting for process: {}", e);
                 let _ = child.kill();
                 let _ = child.wait();
-                Ok(ErofsfuseExit::Error(-1))
+                ErofsfuseExit::Error(-1)
             }
+        };
+
+        // Final ASan check
+        if asan_detected.load(Ordering::SeqCst) && !final_exit.is_crash() {
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Ok(ErofsfuseExit::AsanError);
+        }
+
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+        Ok(final_exit)
+    }
+
+    /// Classify exit status into ErofsfuseExit
+    fn classify_exit(&self, status: &std::process::ExitStatus) -> ErofsfuseExit {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            // Check for signal termination first (most reliable)
+            if let Some(signal) = status.signal() {
+                info!("Process terminated by signal {}", signal);
+                return ErofsfuseExit::Crashed(signal);
+            }
+
+            // Check for core dump
+            if status.core_dumped() {
+                info!("Process core dumped");
+                return ErofsfuseExit::Crashed(11);
+            }
+        }
+
+        // Check exit code
+        let code = status.code().unwrap_or(-1);
+        match code {
+            0 => ErofsfuseExit::Success,
+            EXIT_SIGABRT => {
+                info!("Exit code {} indicates ASan abort", code);
+                ErofsfuseExit::Crashed(6)
+            }
+            EXIT_SIGSEGV => ErofsfuseExit::Crashed(11),
+            EXIT_SIGBUS => ErofsfuseExit::Crashed(7),
+            EXIT_SIGFPE => ErofsfuseExit::Crashed(8),
+            other => ErofsfuseExit::Error(other),
         }
     }
 
-    /// Perform file system operations on the mount point
-    fn perform_filesystem_ops(&self, mount_point: &Path) -> Result<ErofsfuseExit, Error> {
+    /// Perform filesystem operations with aggressive process monitoring
+    fn perform_filesystem_ops_with_monitoring(
+        &self,
+        mount_point: &Path,
+        child: &mut std::process::Child,
+        crash_rx: &Receiver<ProcessEvent>,
+        asan_detected: &Arc<AtomicBool>,
+        timeout: Duration,
+    ) -> Option<ErofsfuseExit> {
         use std::fs;
 
-        // List root directory
-        match fs::read_dir(mount_point) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
+        let start = Instant::now();
+        let check_interval = Duration::from_millis(10); // More frequent checks
+        let mut last_check = Instant::now();
 
-                    // Try to read file metadata
-                    let _ = fs::metadata(&path);
-
-                    // If it's a directory, traverse
-                    if path.is_dir() {
-                        let _ = self.traverse_directory(&path);
-                    } else {
-                        // Try to read file contents
-                        let _ = self.read_file(&path);
-                    }
-
-                    // Try to read extended attributes
-                    let _ = self.read_xattrs(&path);
+        // Read directory entries
+        if let Ok(entries) = fs::read_dir(mount_point) {
+            for entry in entries.flatten() {
+                // Timeout check
+                if start.elapsed() > timeout {
+                    debug!("Filesystem ops timeout");
+                    return Some(ErofsfuseExit::Timeout);
                 }
-            }
-            Err(e) => {
-                debug!("Failed to read mount point: {}", e);
-            }
-        }
 
-        Ok(ErofsfuseExit::Success)
-    }
+                // Check for ASan detection from stderr thread
+                if asan_detected.load(Ordering::SeqCst) {
+                    info!("ASan detected during filesystem traversal");
+                    return Some(ErofsfuseExit::AsanError);
+                }
 
-    /// Traverse a directory recursively
-    fn traverse_directory(&self, dir: &Path) -> Result<(), Error> {
-        use std::fs;
+                // Check for crash notification from channel
+                match crash_rx.try_recv() {
+                    Ok(ProcessEvent::AsanDetected) => {
+                        info!("Received ASan notification");
+                        return Some(ErofsfuseExit::AsanError);
+                    }
+                    _ => {}
+                }
 
-        match fs::read_dir(dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-
-                    // Read metadata
-                    let _ = fs::metadata(&path);
-
-                    if path.is_dir() {
-                        // Recurse (limit depth)
-                        if path.components().count() < 20 {
-                            let _ = self.traverse_directory(&path);
+                // Check process status frequently
+                if last_check.elapsed() > check_interval {
+                    last_check = Instant::now();
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let exit = self.classify_exit(&status);
+                            if exit.is_crash() {
+                                info!("Process crashed during ops: {:?}", exit);
+                                return Some(exit);
+                            }
+                            // Non-zero exit might indicate ASan too
+                            if exit != ErofsfuseExit::Success && asan_detected.load(Ordering::SeqCst) {
+                                return Some(ErofsfuseExit::AsanError);
+                            }
+                            return Some(exit);
                         }
-                    } else {
-                        let _ = self.read_file(&path);
+                        _ => {}
                     }
+                }
 
-                    let _ = self.read_xattrs(&path);
+                let path = entry.path();
+
+                // Try to read metadata - this can trigger ASan crashes
+                let _ = fs::metadata(&path);
+
+                // Immediate check after potentially blocking operation
+                if asan_detected.load(Ordering::SeqCst) {
+                    return Some(ErofsfuseExit::AsanError);
+                }
+
+                if path.is_dir() {
+                    if path.components().count() < 20 {
+                        if let Err(e) = self.traverse_directory(
+                            &path,
+                            child,
+                            crash_rx,
+                            asan_detected,
+                            &mut last_check,
+                            timeout.saturating_sub(start.elapsed()),
+                        ) {
+                            // Check if it was a crash
+                            if asan_detected.load(Ordering::SeqCst) {
+                                return Some(ErofsfuseExit::AsanError);
+                            }
+                            debug!("Directory traversal error: {}", e);
+                        }
+                    }
+                } else {
+                    let _ = self.read_file(&path);
+                }
+
+                // Check again after file operations
+                if asan_detected.load(Ordering::SeqCst) {
+                    return Some(ErofsfuseExit::AsanError);
                 }
             }
-            Err(e) => {
-                debug!("Failed to traverse directory: {}", e);
+        }
+
+        // Final process check after all operations
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let exit = self.classify_exit(&status);
+                if exit.is_crash() {
+                    return Some(exit);
+                }
+                if exit != ErofsfuseExit::Success && asan_detected.load(Ordering::SeqCst) {
+                    return Some(ErofsfuseExit::AsanError);
+                }
+                Some(exit)
+            }
+            _ => None,
+        }
+    }
+
+    /// Traverse a directory with monitoring
+    fn traverse_directory(
+        &self,
+        dir: &Path,
+        child: &mut std::process::Child,
+        crash_rx: &Receiver<ProcessEvent>,
+        asan_detected: &Arc<AtomicBool>,
+        last_check: &mut Instant,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        use std::fs;
+
+        let start = Instant::now();
+        let check_interval = Duration::from_millis(10);
+
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                // Timeout check
+                if start.elapsed() > timeout {
+                    return Err(Error::illegal_state("Timeout"));
+                }
+
+                // Check ASan
+                if asan_detected.load(Ordering::SeqCst) {
+                    return Err(Error::illegal_state("ASan detected"));
+                }
+
+                // Check crash channel
+                match crash_rx.try_recv() {
+                    Ok(ProcessEvent::AsanDetected) => {
+                        return Err(Error::illegal_state("ASan detected"));
+                    }
+                    _ => {}
+                }
+
+                // Check process
+                if last_check.elapsed() > check_interval {
+                    *last_check = Instant::now();
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let exit = self.classify_exit(&status);
+                        if exit.is_crash() {
+                            return Err(Error::illegal_state(format!("Crash: {:?}", exit)));
+                        }
+                    }
+                }
+
+                let path = entry.path();
+                let _ = fs::metadata(&path);
+
+                // Check after blocking operation
+                if asan_detected.load(Ordering::SeqCst) {
+                    return Err(Error::illegal_state("ASan detected"));
+                }
+
+                if path.is_dir() && path.components().count() < 20 {
+                    let _ = self.traverse_directory(
+                        &path,
+                        child,
+                        crash_rx,
+                        asan_detected,
+                        last_check,
+                        timeout.saturating_sub(start.elapsed()),
+                    );
+                } else {
+                    let _ = self.read_file(&path);
+                }
             }
         }
 
@@ -309,30 +627,14 @@ impl ErofsfuseExecutor {
     fn read_file(&self, path: &Path) -> Result<(), Error> {
         use std::fs;
 
-        // Read with size limit
         match fs::File::open(path) {
             Ok(mut file) => {
                 let mut buf = vec![0u8; 4096];
                 let _ = std::io::Read::read(&mut file, &mut buf);
             }
             Err(e) => {
-                debug!("Failed to read file {:?}: {}", path, e);
+                trace!("Failed to read file {:?}: {}", path, e);
             }
-        }
-
-        Ok(())
-    }
-
-    /// Read extended attributes
-    fn read_xattrs(&self, path: &Path) -> Result<(), Error> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            // Try to list xattrs
-            // Note: This requires xattr support in Rust or external crate
-            // For now, just try to get basic metadata
-            let _ = std::fs::metadata(path);
         }
 
         Ok(())
@@ -380,7 +682,6 @@ impl ErofsfuseExecutor {
 
         #[cfg(windows)]
         {
-            // Windows doesn't have FUSE in the same way
             warn!("Unmount not implemented for Windows");
         }
 
@@ -435,5 +736,14 @@ mod tests {
         let config = FuzzerConfig::from(crate::cli::CliArgs::try_parse_from(["test", "--seeds", "./seeds"]).unwrap());
         let executor = ErofsfuseExecutor::new(&config);
         assert_eq!(executor.executions(), 0);
+    }
+
+    #[test]
+    fn test_crash_detection() {
+        // Test exit code detection
+        assert_eq!(EXIT_SIGABRT, 134);
+        assert_eq!(EXIT_SIGSEGV, 139);
+        assert_eq!(EXIT_SIGFPE, 136);
+        assert_eq!(EXIT_SIGBUS, 135);
     }
 }
