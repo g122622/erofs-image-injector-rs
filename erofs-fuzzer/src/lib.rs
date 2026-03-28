@@ -14,7 +14,7 @@ mod qemu_executor;
 
 pub use cli::*;
 pub use executor::*;
-pub use executor_trait::*;
+pub use executor_trait::{Executor, ExecutorConfig, ExecutionResult};
 pub use fuzzer::*;
 pub use harness::*;
 pub use kernel_monitor::*;
@@ -23,6 +23,6 @@ pub use qemu_executor::*;
 /// Re-exports for convenience
 pub mod prelude {
     pub use crate::{CliArgs, ErofsfuseExecutor, FuzzerConfig, run_fuzzer};
-    pub use crate::{Executor, ExecutorConfig, ExecutorType, ExecutionResult};
+    pub use crate::{Executor, ExecutorConfig, ExecutionResult};
     pub use crate::{QemuKernelExecutor, KernelMonitor, KernelCrashInfo, KernelIssue};
 }

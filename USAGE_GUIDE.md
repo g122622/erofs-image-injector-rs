@@ -1,891 +1,321 @@
 # EROFS 图像模糊测试工具使用指南
 
-> 本指南面向 EROFS 开发者，帮助您理解和使用本模糊测试工具。假设您熟悉 C 语言开发，但对 Rust 和模糊测试概念不太熟悉。
+> 本指南面向 EROFS/Linux 内核开发者，帮助您快速上手模糊测试工具。
+>
+> **前置知识**：熟悉 C 语言和 Linux 内核开发，但对 Rust 和模糊测试概念可能不太熟悉。
 
 ## 目录
 
-1. [什么是模糊测试？](#什么是模糊测试)
+1. [快速上手（5分钟）](#快速上手5分钟)
 2. [工具概述](#工具概述)
 3. [核心概念解释](#核心概念解释)
 4. [环境准备](#环境准备)
-5. [快速开始](#快速开始)
-6. [详细使用说明](#详细使用说明)
-7. [输出结果解读](#输出结果解读)
-8. [高级配置](#高级配置)
+5. [用户态测试](#用户态测试)
+6. [内核态测试](#内核态测试)
+7. [精准注入模式](#精准注入模式)
+8. [输出结果解读](#输出结果解读)
 9. [常见问题](#常见问题)
-10. [技术原理](#技术原理)
 
 ---
 
-## 什么是模糊测试？
+## 快速上手（5分钟）
 
-模糊测试（Fuzzing）是一种自动化软件测试技术，通过向程序输入大量随机或半随机的数据，来发现程序的崩溃、内存泄漏、安全漏洞等问题。
+### 方式一：用户态测试（推荐新手）
 
-```mermaid
-flowchart LR
-    A[种子输入] --> B[变异器]
-    B --> C[变异后的输入]
-    C --> D[目标程序]
-    D --> E{崩溃？}
-    E -->|是| F[保存崩溃样本]
-    E -->|否| G[继续测试]
-    G --> B
+测试用户态 `erofsfuse` 解析器，无需编译内核：
+
+```bash
+# 1. 编译项目
+cargo build --release
+
+# 2. 准备种子（有效的 EROFS 图像）
+mkdir -p seeds
+echo "test" > /tmp/test.txt
+mkfs.erofs -E noinline_data seeds/test.erofs /tmp/test.txt
+
+# 3. 安装 erofsfuse（如果没有）
+sudo apt install erofs-utils
+
+# 4. 运行测试（100次迭代）
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --iterations 100 \
+    --timeout 30
 ```
 
-### 为什么 EROFS 需要模糊测试？
+### 方式二：内核态测试（发现内核漏洞）
 
-EROFS 文件系统涉及复杂的磁盘格式解析：
+测试 Linux 内核 EROFS 驱动，需要编译测试内核：
 
-- **攻击面**：解析恶意构造的 EROFS 图像可能导致内核崩溃或内存损坏
-- **边界条件**：特殊值（如极端大小、错误偏移）可能触发未处理的边界情况
-- **格式复杂性**：超级块、inode、目录项、扩展属性等多种数据结构
+```bash
+# 1. 编译测试内核（约 15-30 分钟）
+./scripts/build_kernel.sh
+
+# 2. 运行内核态测试
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --executor qemu \
+    --kernel ./kernel_build/bzImage \
+    --initramfs ./kernel_build/rootfs.cpio.gz \
+    --qemu-path /usr/bin/qemu-system-x86_64 \
+    --iterations 10 \
+    --timeout 120
+```
 
 ---
 
 ## 工具概述
 
-本工具是基于 **LibAFL** 框架开发的 EROFS 图像模糊测试器，主要特点：
+### 这个工具能做什么？
 
-| 特性 | 说明 |
-|------|------|
-| 结构感知变异 | 理解 EROFS 格式，智能修改关键字段而非随机破坏 |
-| 多目标支持 | 超级块、inode、目录项、扩展属性等 |
-| ASan 集成 | 自动检测内存安全问题 |
-| 并行测试 | 支持多进程并行提高效率 |
+| 测试目标 | 测试内容 | 发现的漏洞类型 |
+|---------|---------|---------------|
+| **用户态** erofsfuse | 用户空间 EROFS 解析代码 | 内存越界、空指针、UAF |
+| **内核态** EROFS 驱动 | Linux 内核 fs/erofs/ 代码 | 内核崩溃、内存损坏、KASAN 报告 |
 
-### 工作流程图
+### 工作原理（类比说明）
 
-```mermaid
-flowchart TB
-    subgraph 准备阶段
-        A[创建种子目录结构] --> B[使用 mkfs.erofs 生成种子图像]
-        B --> C[将种子放入 seeds/ 目录]
-    end
-
-    subgraph 模糊测试
-        C --> D[加载种子]
-        D --> E[选择种子]
-        E --> F[结构感知变异]
-        F --> G[生成测试用例]
-        G --> H[erofsfuse 挂载测试]
-        H --> I{检测到崩溃？}
-        I -->|是| J[保存崩溃样本]
-        I -->|否| K[继续下一轮]
-        K --> E
-    end
-
-    subgraph 结果分析
-        J --> L[分析崩溃日志]
-        L --> M[定位问题代码]
-    end
 ```
+┌─────────────────────────────────────────────────────────────┐
+│  如果您熟悉内核开发，可以这样理解：                            │
+│                                                             │
+│  传统测试：您写一个 test_case.c，调用函数，检查返回值         │
+│                                                             │
+│  模糊测试：工具自动生成成千上万个随机输入，尝试触发崩溃        │
+│           类似 syzkaller，但专注于 EROFS 文件系统格式        │
+│                                                             │
+│  本工具特点：                                                │
+│  - 结构感知：理解 EROFS 超级块、inode 等结构，不是随机字节   │
+│  - 覆盖引导：优先测试未覆盖的代码路径                        │
+│  - ASan 集成：自动检测内存错误                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 与 syzkaller 的对比
+
+| 特性 | 本工具 | syzkaller |
+|------|--------|-----------|
+| 测试方式 | 文件系统镜像注入 | 系统调用生成 |
+| 测试目标 | EROFS 文件解析 | 任意内核子系统 |
+| 结构感知 | EROFS 格式专用 | 通用系统调用描述 |
+| 用户态测试 | ✅ 支持 | ❌ 仅内核 |
+| 上手难度 | 低（无需编写描述文件） | 高（需要编写描述） |
 
 ---
 
 ## 核心概念解释
 
-### 1. 种子（Seed）
+### 1. 种子（Seed）—— 测试起点
 
-种子是模糊测试的起点——有效的 EROFS 图像文件。好的种子能帮助测试器发现更多问题。
+种子是一个**有效的** EROFS 镜像文件。模糊测试器从种子出发，通过变异生成新的测试用例。
 
-**如何创建种子？**
+**类比**：种子就像一个"正常"的测试用例，工具会对其"做手脚"来测试边界情况。
 
 ```bash
-# 创建一个简单的目录结构
-mkdir -p seed_content/dir1/dir2
-echo "Hello, EROFS!" > seed_content/file.txt
-echo "测试内容" > seed_content/dir1/中文文件.txt
-
-# 使用 mkfs.erofs 生成 EROFS 图像
-mkfs.erofs -E noinline_data seed.erofs seed_content/
+# 创建种子的最简单方法
+mkdir -p seeds
+mkdir -p /tmp/content
+echo "hello" > /tmp/content/file.txt
+mkfs.erofs seeds/basic.erofs /tmp/content/
 ```
 
-### 2. 变异（Mutation）
+**好种子的特点**：
+- 覆盖不同文件类型（普通文件、目录、符号链接）
+- 包含压缩数据（如果启用压缩）
+- 包含扩展属性（xattr）
+- 深层目录结构
 
-变异是对种子进行修改以产生新测试用例的过程。本工具实现了多种结构感知变异：
+### 2. 变异（Mutation）—— 自动化的"破坏"
 
-```mermaid
-mindmap
-  root((变异类型))
-    位翻转
-      随机翻转比特位
-      模拟数据损坏
-    超级块变异
-      修改魔数
-      修改块大小
-      修改功能标志
-      修改 UUID
-    Inode 变异
-      修改文件模式
-      修改文件大小
-      修改 UID/GID
-      修改时间戳
-    目录项变异
-      修改文件名
-      修改 inode 编号
-      修改目录项类型
-    扩展属性变异
-      修改属性名
-      修改属性值
-```
+变异器对种子进行智能修改，生成可能触发漏洞的输入。
 
-### 3. 测试执行器（Executor）
+| 变异器 | 目标结构 | 等效的 C 代码类比 |
+|--------|---------|------------------|
+| `ErofsSuperblockMutator` | 超级块 | 修改 `struct erofs_super_block` |
+| `ErofsInodeMutator` | inode | 修改 `struct erofs_inode_compact` |
+| `ErofsDirectoryMutator` | 目录项 | 修改 `struct erofs_dirent` |
+| `ErofsXattrMutator` | 扩展属性 | 修改 xattr 头和条目 |
 
-执行器负责运行被测试程序（erofsfuse）并监控其行为：
+### 3. 执行器（Executor）—— 运行测试
 
-```mermaid
-sequenceDiagram
-    participant F as 模糊测试器
-    participant E as 执行器
-    participant T as erofsfuse
-    participant M as 挂载点
-
-    F->>E: 发送变异后的图像
-    E->>E: 写入临时文件
-    E->>T: 启动 erofsfuse image mount_point
-    T->>M: 挂载文件系统
-    E->>M: 遍历目录、读取文件
-    alt 检测到崩溃
-        M-->>E: 崩溃信号
-        E->>F: 返回崩溃结果
-    else 正常执行
-        E->>T: 卸载文件系统
-        E->>F: 返回正常结果
-    end
-```
-
-### 4. 覆盖引导（Coverage-Guided）
-
-覆盖引导模糊测试会追踪哪些代码路径被测试到，优先探索新路径：
-
-```mermaid
-flowchart LR
-    A[测试用例] --> B[执行]
-    B --> C{发现新路径？}
-    C -->|是| D[加入语料库]
-    C -->|否| E[丢弃]
-    D --> F[基于新用例继续变异]
-```
+| 执行器 | 测试目标 | 崩溃检测 |
+|--------|---------|---------|
+| `ErofsfuseExecutor` | 用户态 erofsfuse | 进程退出码、信号、ASan |
+| `QemuKernelExecutor` | 内核 EROFS 驱动 | 内核 panic、Oops、KASAN |
 
 ---
 
 ## 环境准备
 
-### 系统要求
-
-- **操作系统**：Linux（推荐 Ubuntu 20.04+ 或 WSL2）
-- **架构**：x86_64 或 ARM64
-- **内存**：至少 4GB RAM
-- **磁盘**：至少 10GB 可用空间
-
-### 安装步骤
-
-#### 第一步：安装 Rust 工具链
-
-Rust 是本项目的开发语言。您不需要深入学习 Rust，只需安装编译环境。
+### 必需依赖
 
 ```bash
-# 下载并运行 Rust 安装脚本
+# Rust 工具链（编译本工具）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 按提示选择 1) 继续安装（默认选项）
-# 安装完成后，重新加载环境
 source $HOME/.cargo/env
 
-# 验证安装
-rustc --version
-cargo --version
+# 基本编译工具
+sudo apt install build-essential
+
+# EROFS 工具（创建种子）
+sudo apt install erofs-utils
 ```
 
-#### 第二步：编译带有 ASan 的 erofsfuse
-
-AddressSanitizer (ASan) 是一个内存错误检测工具，能帮助发现：
-
-- 堆缓冲区溢出
-- 栈缓冲区溢出
-- 释放后使用（use-after-free）
-- 双重释放（double-free）
+### 用户态测试依赖
 
 ```bash
-# 安装编译依赖
-sudo apt update
-sudo apt install -y build-essential clang llvm libfuse3-dev liblz4-dev libzstd-dev
+# erofsfuse（用户态解析器）
+sudo apt install erofs-utils libfuse3-dev
 
-# 克隆 erofs-utils 源码
+# 可选：ASan 版本（检测更多内存问题）
 git clone https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git
 cd erofs-utils
-
-# 使用 Clang 编译并启用 ASan
-# 注意：ASan 需要同时用于编译和链接
-CC=clang \
-CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -fcommon" \
-LDFLAGS="-fsanitize=address" \
-./configure --enable-fuse
-
-# 编译（使用所有 CPU 核心）
+CC=clang CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+  LDFLAGS="-fsanitize=address" ./configure --enable-fuse
 make -j$(nproc)
-
-# 编译完成后，erofsfuse 位于 fuse/ 目录
-ls -la fuse/erofsfuse
+# erofsfuse 位于 fuse/erofsfuse
 ```
 
-**重要提示**：ASan 会显著降低程序速度（约 2-5 倍），但能检测到更多内存问题。
-
-#### 第三步：安装 mkfs.erofs（用于生成种子）
+### 内核态测试依赖
 
 ```bash
-# 方法一：使用系统包管理器（推荐）
-sudo apt install erofs-utils
+# QEMU
+sudo apt install qemu-system-x86
 
-# 方法二：使用上面编译的版本
-# mkfs.erofs 已经包含在 erofs-utils 编译产物中
-sudo cp mkfs/erofs.mkfs /usr/local/bin/mkfs.erofs
+# 内核编译依赖
+sudo apt install flex bison bc libelf-dev libssl-dev
+
+# 编译测试内核（约 15-30 分钟）
+./scripts/build_kernel.sh
 ```
 
-#### 第四步：编译模糊测试器
+---
+
+## 用户态测试
+
+### 基本命令
 
 ```bash
-# 克隆项目（或使用您已有的源码）
-cd /path/to/erofs-image-injector-rs
-
-# 编译发布版本（优化后的二进制）
+# 编译
 cargo build --release
 
-# 编译完成后，可执行文件位于
-ls -la target/release/erofs-fuzzer
-```
-
-**编译时间说明**：首次编译需要下载并编译所有依赖，可能需要 5-15 分钟。
-
----
-
-## 快速开始
-
-### 第一步：准备种子目录
-
-```bash
-# 创建种子存放目录
-mkdir -p seeds
-
-# 创建测试内容
-mkdir -p test_content/subdir
-echo "Hello World" > test_content/file.txt
-echo "Nested file" > test_content/subdir/nested.txt
-echo "中文测试内容" > test_content/中文.txt
-
-# 生成 EROFS 图像作为种子
-mkfs.erofs -E noinline_data seeds/basic.erofs test_content/
-
-# 清理临时目录
-rm -rf test_content
-
-# 验证种子
-ls -la seeds/
-```
-
-### 第二步：创建必要的输出目录
-
-```bash
-mkdir -p crashes corpus
-```
-
-### 第三步：运行模糊测试
-
-```bash
-# 基本用法
+# 运行（快速测试）
 ./target/release/erofs-fuzzer \
     --seeds ./seeds \
-    --output ./crashes \
-    --erofsfuse-path ./erofs-utils/fuse/erofsfuse \
-    --iterations 10000
-
-# 输出示例：
-# [INFO] Initializing EROFS fuzzer...
-# [INFO] Loaded 1 seeds
-# [INFO] Starting fuzzing loop...
-# [INFO] Iterations: 100, Crashes: 0, Corpus: 1
-# [INFO] Iterations: 200, Crashes: 0, Corpus: 1
-# ...
-```
-
-### 第四步：分析崩溃（如果有）
-
-```bash
-# 查看崩溃文件
-ls -la crashes/
-
-# 示例输出：
-# crash-000001a2b3c4d5e6-signal-11.erofs  # 触发崩溃的图像文件
-# crash-000001a2b3c4d5e6-signal-11.log    # 崩溃详情
-
-# 查看崩溃日志
-cat crashes/crash-000001a2b3c4d5e6-signal-11.log
-```
-
----
-
-## 详细使用说明
-
-### 命令行参数详解
-
-```mermaid
-flowchart BT
-    subgraph 必需参数
-        A["--seeds <目录>"]
-    end
-
-    subgraph 输出参数
-        B["--output <目录>"]
-        C["--corpus <目录>"]
-    end
-
-    subgraph 执行参数
-        D["--erofsfuse-path <路径>"]
-        E["--timeout <秒>"]
-        F["--iterations <次数>"]
-    end
-
-    subgraph 调优参数
-        G["--workers <数量>"]
-        H["--max-size <字节>"]
-        I["--min-size <字节>"]
-        J["--mutations-per-input <次数>"]
-    end
-
-    subgraph 调试参数
-        K["--log-level <级别>"]
-        L["--verbose"]
-        M["--asan"]
-    end
-```
-
-#### 完整参数列表
-
-| 参数 | 简写 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--seeds` | `-s` | 必需 | 种子 EROFS 图像所在目录 |
-| `--output` | `-o` | `./crashes` | 崩溃输出目录 |
-| `--corpus` | | `./corpus` | 有趣输入存放目录 |
-| `--erofsfuse-path` | | `erofsfuse` | erofsfuse 可执行文件路径 |
-| `--timeout` | `-t` | `60` | 每次执行超时时间（秒） |
-| `--iterations` | `-i` | `0`（无限） | 最大迭代次数 |
-| `--workers` | `-w` | `1` | 并行工作进程数 |
-| `--max-size` | | `16777216` (16MB) | 最大图像大小 |
-| `--min-size` | | `4096` (4KB) | 最小图像大小 |
-| `--mutations-per-input` | | `4` | 每个输入的变异次数 |
-| `--log-level` | | `info` | 日志级别 |
-| `--verbose` | `-v` | false | 详细输出 |
-| `--asan` | | false | 启用 ASan 检测 |
-| `--mount-base` | | `/tmp/erofs-fuzz` | 挂载点基础目录 |
-
-### 推荐配置场景
-
-#### 场景一：快速验证（开发调试）
-
-```bash
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --output ./crashes \
-    --erofsfuse-path /path/to/erofsfuse \
     --iterations 1000 \
-    --timeout 30 \
-    --log-level debug
+    --timeout 30
 ```
 
-#### 场景二：标准测试（日常使用）
-
-```bash
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --output ./crashes \
-    --erofsfuse-path /path/to/erofsfuse \
-    --iterations 100000 \
-    --workers 4 \
-    --timeout 60
-```
-
-#### 场景三：深度测试（CI/CD 或长期测试）
+### 使用 ASan 版本检测更多问题
 
 ```bash
 # 使用 ASan 编译的 erofsfuse
 ./target/release/erofs-fuzzer \
     --seeds ./seeds \
-    --output ./crashes \
-    --erofsfuse-path /path/to/asan-erofsfuse \
-    --iterations 0 \
-    --workers $(nproc) \
-    --timeout 120 \
+    --erofsfuse-path ./erofs-utils/fuse/erofsfuse \
     --asan \
-    --log-level warn
+    --iterations 10000
 ```
 
-### 种子管理最佳实践
+### 命令行参数速查
 
-#### 种子多样性
-
-多样化的种子能发现更多问题：
-
-```bash
-# 创建多种类型的种子
-mkdir -p seeds
-
-# 1. 最小图像（空目录）
-mkdir empty_dir
-mkfs.erofs seeds/minimal.erofs empty_dir/
-rm -rf empty_dir
-
-# 2. 深层目录结构
-mkdir -p deep/a/b/c/d/e/f/g
-echo "deep" > deep/a/b/c/d/e/f/g/file.txt
-mkfs.erofs seeds/deep.erofs deep/
-rm -rf deep
-
-# 3. 大文件
-dd if=/dev/urandom of=large_file bs=1M count=10
-mkfs.erofs seeds/large.erofs large_file
-rm large_file
-
-# 4. 特殊字符文件名
-mkdir special
-touch "special/空格 文件名.txt"
-touch "special/特殊!@#.txt"
-mkfs.erofs seeds/special.erofs special/
-rm -rf special
-
-# 5. 压缩内容（如果启用压缩支持）
-mkdir compressed
-echo "AAAAAAAAAAAAAAAA" > compressed/repeat.txt
-mkfs.erofs -z lz4hc seeds/compressed.erofs compressed/
-rm -rf compressed
-```
-
-#### 种子验证
-
-```bash
-# 验证种子是否有效
-for seed in seeds/*.erofs; do
-    echo "Testing $seed..."
-    mkdir -p /tmp/erofs_test
-    erofsfuse "$seed" /tmp/erofs_test && echo "OK" || echo "FAILED"
-    fusermount -u /tmp/erofs_test
-    rm -rf /tmp/erofs_test
-done
-```
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--seeds` | 必需 | 种子目录 |
+| `--output` | `./crashes` | 崩溃输出目录 |
+| `--iterations` | 0（无限） | 最大迭代次数 |
+| `--timeout` | 60 | 单次执行超时（秒） |
+| `--workers` | 1 | 并行进程数 |
+| `--erofsfuse-path` | `erofsfuse` | erofsfuse 路径 |
+| `--asan` | false | 启用 ASan 检测 |
+| `--log-level` | info | 日志级别 |
 
 ---
 
-## 输出结果解读
+## 内核态测试
 
-### 目录结构
+内核态测试通过 QEMU 运行编译的测试内核，将变异后的 EROFS 镜像作为块设备挂载，测试内核 EROFS 驱动。
 
-```
-crashes/
-├── crash-000001a2b3c4d5e6-signal-11.erofs    # 触发崩溃的图像
-├── crash-000001a2b3c4d5e6-signal-11.log       # 崩溃详情
-├── crash-000002b4c5d6e7f8-signal-6.erofs
-├── crash-000002b4c5d6e7f8-signal-6.log
-└── ...
+### 测试内核特性
 
-corpus/
-├── erofs_input_abc123...erofs   # 发现新路径的输入
-├── erofs_input_def456...erofs
-└── ...
-```
+编译的测试内核包含以下调试选项：
 
-### 崩溃文件命名规则
-
-```
-crash-<时间戳>-signal-<信号号>.erofs
-```
-
-常见信号号及其含义：
-
-| 信号 | 名称 | 含义 |
-|------|------|------|
-| 6 | SIGABRT | 程序主动中止（通常由 assert 或 ASan 触发） |
-| 11 | SIGSEGV | 段错误（非法内存访问） |
-| 7 | SIGBUS | 总线错误（内存对齐问题） |
-| 8 | SIGFPE | 浮点异常（除零等） |
-
-### 崩溃日志内容
-
-```log
-Signal: 11
-Iteration: 12345
-Size: 8192 bytes
-```
-
-### 分析崩溃的方法
-
-#### 方法一：直接重现
-
-```bash
-# 使用崩溃文件测试
-erofsfuse crashes/crash-xxx-signal-11.erofs /tmp/test_mount
-
-# 如果崩溃，可以调试
-gdb --args erofsfuse crashes/crash-xxx-signal-11.erofs /tmp/test_mount
-```
-
-#### 方法二：使用 ASan 获取详细信息
-
-```bash
-# 使用 ASan 版本的 erofsfuse
-# ASan 会输出详细的错误信息
-ASAN_OPTIONS=symbolize=1 ./erofs-utils-asan/fuse/erofsfuse \
-    crashes/crash-xxx-signal-11.erofs /tmp/test_mount
-```
-
-ASan 输出示例：
-```
-=================================================================
-==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6020000001f8
-READ of size 4 at 0x6020000001f8 thread T0
-    #0 0x7f1234567890 in erofs_read_inode /path/to/erofs-utils/lib/inode.c:123
-    #1 0x7f1234567900 in erofs_iget /path/to/erofs-utils/lib/inode.c:456
-    ...
-```
-
-#### 方法三：最小化崩溃用例
-
-```bash
-# 有时崩溃文件较大，可以使用工具简化
-# 创建一个简单的最小化脚本
-./scripts/minimize_crash.sh crashes/crash-xxx-signal-11.erofs
-```
-
----
-
-## 高级配置
-
-### 并行模糊测试
-
-```bash
-# 使用所有 CPU 核心
-WORKERS=$(nproc)
-
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --output ./crashes \
-    --erofsfuse-path /path/to/erofsfuse \
-    --workers $WORKERS
-```
-
-### 自定义变异策略
-
-项目支持多种变异策略，可以在代码中调整权重：
-
-| 变异器 | 目标 | 说明 |
-|--------|------|------|
-| ErofsBitflipMutator | 随机位翻转 | 模拟数据损坏 |
-| ErofsSuperblockMutator | 超级块 | 修改魔数、块大小、功能标志等 |
-| ErofsInodeMutator | Inode | 修改文件模式、大小、UID/GID 等 |
-| ErofsDirectoryMutator | 目录项 | 修改文件名、inode 号等 |
-| ErofsXattrMutator | 扩展属性 | 修改属性名值对 |
-
-### ASan 环境变量配置
-
-```bash
-# 设置 ASan 选项
-export ASAN_OPTIONS="symbolize=1:abort_on_error=1:detect_leaks=1"
-
-# 运行模糊测试
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --erofsfuse-path /path/to/asan-erofsfuse \
-    --asan
-```
-
-常用 ASan 选项：
-
-| 选项 | 说明 |
+| 选项 | 用途 |
 |------|------|
-| `symbolize=1` | 显示符号化的堆栈跟踪 |
-| `abort_on_error=1` | 发现错误时立即中止 |
-| `detect_leaks=1` | 启用内存泄漏检测 |
-| `detect_stack_use_after_return=1` | 检测返回后使用栈内存 |
-| `halt_on_error=0` | 发现错误后继续运行 |
+| `CONFIG_KASAN` | 内核地址消毒器，检测内存错误 |
+| `CONFIG_KCOV` | 代码覆盖率收集 |
+| `CONFIG_EROFS_FS_DEBUG` | EROFS 调试输出 |
+| `CONFIG_DEBUG_KMEMLEAK` | 内存泄漏检测 |
+| `CONFIG_LOCKDEP` | 锁依赖检测 |
 
----
-
-## 常见问题
-
-### Q1: 编译时提示找不到 libfuse
+### 运行内核态测试
 
 ```bash
-# 安装 FUSE 开发库
-sudo apt install libfuse3-dev
+# 编译测试内核（首次需要）
+./scripts/build_kernel.sh
 
-# 如果还是不行，尝试
-sudo apt install libfuse-dev
-```
-
-### Q2: 运行时提示 "erofsfuse not found"
-
-```bash
-# 方法一：指定完整路径
+# 运行 fuzzer
 ./target/release/erofs-fuzzer \
-    --erofsfuse-path /full/path/to/erofsfuse \
-    --seeds ./seeds
-
-# 方法二：将 erofsfuse 加入 PATH
-export PATH=$PATH:/path/to/erofs-utils/fuse
+    --seeds ./seeds \
+    --output ./crashes_kernel \
+    --executor qemu \
+    --kernel ./kernel_build/bzImage \
+    --initramfs ./kernel_build/rootfs.cpio.gz \
+    --qemu-path /usr/bin/qemu-system-x86_64 \
+    --timeout 120 \
+    --iterations 100
 ```
 
-### Q3: 挂载失败
+### 单个镜像测试
+
+使用脚本快速测试单个镜像：
 
 ```bash
-# 检查 FUSE 是否正常工作
-fusermount -V
+# 测试单个镜像
+./scripts/run_qemu_test.sh ./seeds/test.erofs
 
-# 检查当前用户是否有 FUSE 权限
-ls -la /dev/fuse
+# 指定内核和内存
+KERNEL=./kernel_build/bzImage \
+ROOTFS=./kernel_build/rootfs.cpio.gz \
+MEMORY=1024 \
+./scripts/run_qemu_test.sh ./crashes/crash-xxx.erofs
 
-# 如果权限不足，将用户加入 fuse 组
-sudo usermod -aG fuse $USER
-# 注销后重新登录生效
+# 启用调试输出
+./scripts/run_qemu_test.sh ./test.erofs --debug
 ```
 
-### Q4: 内存不足
+### 检测结果
 
-```bash
-# 减小图像大小限制
-./target/release/erofs-fuzzer \
-    --max-size 4194304 \  # 4MB
-    --seeds ./seeds
+脚本会自动检测：
+- **Kernel Panic** — 内核崩溃
+- **Kernel Oops** — 内核错误
+- **EROFS Error** — EROFS 相关错误
+- **Call Trace** — 调用栈追踪
+- **KASAN Report** — 内存错误报告
 
-# 减少并行工作进程数
-./target/release/erofs-fuzzer \
-    --workers 1 \
-    --seeds ./seeds
-```
+### 内核态测试参数
 
-### Q5: 测试速度很慢
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--executor` | `erofsfuse` | 执行器类型：`erofsfuse` 或 `qemu` |
+| `--kernel` | `./kernel_build/bzImage` | 内核镜像路径 |
+| `--initramfs` | `./kernel_build/rootfs.cpio.gz` | initramfs 路径 |
+| `--qemu-path` | `qemu-system-x86_64` | QEMU 可执行文件路径 |
+| `--qemu-memory` | 512 | QEMU 内存大小（MB） |
 
-```bash
-# 如果使用 ASan，这是正常的（速度下降 2-5 倍）
-# 可以先用非 ASan 版本快速测试，再用 ASan 版本深入测试
+### 性能优化建议
 
-# 减少每次执行的变异次数
-./target/release/erofs-fuzzer \
-    --mutations-per-input 2 \
-    --seeds ./seeds
-```
+由于测试内核包含调试选项，启动较慢：
 
-### Q6: 如何查看详细的测试进度？
-
-```bash
-# 使用 debug 或 trace 日志级别
-./target/release/erofs-fuzzer \
-    --log-level debug \
-    --seeds ./seeds
-```
+1. **增加超时时间**：`--timeout 120` 或更多
+2. **编译快速内核**：修改 `scripts/build_kernel.sh`，禁用 KASAN
+3. **减少种子大小**：使用小文件作为种子
 
 ---
-
-## 技术原理
-
-### EROFS 磁盘格式概述
-
-```mermaid
-graph TB
-    subgraph EROFS图像结构
-        A[0-1023: 保留区域] --> B[1024-1167: 超级块<br/>144 字节]
-        B --> C[1168+: 元数据区域]
-        C --> D[Inode 表]
-        C --> E[目录数据]
-        C --> F[文件数据]
-        C --> G[扩展属性]
-    end
-```
-
-#### 超级块结构
-
-超级块位于偏移 1024 处，包含文件系统元信息：
-
-| 偏移 | 大小 | 字段 | 说明 |
-|------|------|------|------|
-| 0 | 4 | magic | 魔数 (0xE0F5E1E2) |
-| 4 | 4 | checksum | 校验和 |
-| 8 | 4 | feature_compat | 兼容特性标志 |
-| 12 | 1 | blkszbits | 块大小位数（12 = 4KB） |
-| 13 | 1 | sb_extslots | 扩展槽位数 |
-| 14 | 2 | rootnid | 根目录 inode 号 |
-| ... | ... | ... | ... |
-
-#### Inode 结构
-
-EROFS 支持两种 inode 格式：
-
-```mermaid
-graph LR
-    A[Inode 格式] --> B[紧凑格式 32 字节]
-    A --> C[扩展格式 64 字节]
-
-    B --> D[i_format 2B]
-    B --> E[i_mode 2B]
-    B --> F[i_size 4B]
-    B --> G[其他字段...]
-
-    C --> H[相同基础字段]
-    C --> I[扩展时间戳]
-    C --> J[32位 UID/GID]
-```
-
-### 变异策略详解
-
-#### 结构感知变异示例
-
-```mermaid
-sequenceDiagram
-    participant M as 变异器
-    participant I as 输入图像
-    participant F as 字段定位
-
-    M->>I: 解析超级块偏移
-    M->>F: 定位 rootnid 字段（偏移 14）
-    M->>I: 将 rootnid 从 0 改为 0xFFFF
-    M->>I: 解析 inode 偏移
-    M->>F: 定位 i_mode 字段
-    M->>I: 修改文件权限
-    M->>I: 输出变异后的图像
-```
-
-### 测试覆盖率
-
-```mermaid
-pie title EROFS 解析代码覆盖目标
-    "超级块解析" : 15
-    "Inode 解析" : 25
-    "目录遍历" : 20
-    "文件读取" : 25
-    "扩展属性" : 10
-    "压缩处理" : 5
-```
-
-### 与其他工具的对比
-
-| 特性 | 本工具 | AFL++ | syzkaller |
-|------|--------|-------|-----------|
-| 结构感知变异 | ✅ | ❌（需要额外配置） | ✅ |
-| EROFS 专用 | ✅ | ❌ | ❌ |
-| 用户空间测试 | ✅ | ✅ | ❌ |
-| ASan 集成 | ✅ | ✅ | ✅ |
-| 内核测试 | ❌ | ❌ | ✅ |
-
----
-
-## 项目结构说明
-
-```
-erofs-image-injector-rs/
-├── erofs-fuzzer/           # 主程序
-│   ├── src/
-│   │   ├── main.rs         # 入口点
-│   │   ├── cli.rs          # 命令行参数
-│   │   ├── executor.rs     # 执行器（运行 erofsfuse）
-│   │   └── fuzzer.rs       # 模糊测试主循环
-│   └── Cargo.toml
-│
-├── erofs-format/           # EROFS 格式定义
-│   ├── src/
-│   │   ├── lib.rs          # 导出和常量
-│   │   ├── superblock.rs   # 超级块结构
-│   │   ├── inode.rs        # Inode 结构
-│   │   ├── directory.rs    # 目录项结构
-│   │   └── xattr.rs        # 扩展属性
-│   └── Cargo.toml
-│
-├── erofs-input/            # 输入类型
-│   ├── src/
-│   │   └── erofs_input.rs  # ErofsImageInput 类型
-│   └── Cargo.toml
-│
-├── erofs-mutator/          # 变异器
-│   ├── src/
-│   │   ├── lib.rs          # 公共函数
-│   │   ├── bitflip_mutator.rs
-│   │   ├── superblock_mutator.rs
-│   │   ├── inode_mutator.rs
-│   │   ├── directory_mutator.rs
-│   │   └── xattr_mutator.rs
-│   └── Cargo.toml
-│
-├── erofs-generator/        # 种子生成器
-│   ├── src/
-│   │   ├── lib.rs
-│   │   └── generator.rs    # 图像生成逻辑
-│   └── Cargo.toml
-│
-├── Cargo.toml              # 工作空间配置
-├── README.md               # 英文文档
-└── USAGE_GUIDE.md          # 本文档
-```
-
----
-
-## 贡献与反馈
-
-如果您在使用过程中发现问题或有改进建议，欢迎：
-
-1. 在项目仓库提交 Issue
-2. 提交 Pull Request
-3. 联系 EROFS 开发团队
-
-本项目是 GSoC 2026 项目的一部分，感谢 EROFS 社区的支持。
-
----
-
-## 附录：Rust 快速参考
-
-对于不熟悉 Rust 的开发者，这里提供一些基本概念：
-
-### Cargo 命令
-
-```bash
-cargo build          # 编译项目
-cargo build --release  # 编译优化版本
-cargo run            # 运行项目
-cargo test           # 运行测试
-cargo doc            # 生成文档
-```
-
-### 项目配置文件 (Cargo.toml)
-
-```toml
-[package]
-name = "erofs-fuzzer"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-libafl = "0.15"        # 模糊测试框架
-clap = "4"             # 命令行解析
-serde = "1"            # 序列化
-tracing = "0.1"        # 日志
-```
-
-### 常见 Rust 术语
-
-| 术语 | 对应 C 概念 |
-|------|------------|
-| `struct` | 结构体 |
-| `enum` | 枚举（更强大） |
-| `impl` | 实现（方法） |
-| `trait` | 类似接口 |
-| `Option<T>` | 可空类型 |
-| `Result<T, E>` | 返回值或错误 |
-| `Vec<T>` | 动态数组 |
-| `String` | 字符串 |
-
----
-
-*文档版本：1.1*
-*最后更新：2026-03-27*
 
 ## 精准注入模式
 
-精准注入模式允许您精确控制变异的位置和范围，而不是随机进行模糊测试。
+精准注入模式允许精确控制变异的位置，适用于针对性测试特定字段。
 
 ### 基本用法
 
@@ -897,225 +327,240 @@ tracing = "0.1"        # 日志
     --strategy bitflip \
     --iterations 10000
 
-# 精准变异 superblock.checksum 字段及其后 4 字节
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --target superblock.checksum \
-    --after 4 \
-    --strategy boundary
-
-# 精准变异绝对偏移范围
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --range 1028:16 \
-    --strategy zero
-
-# 仅使用精准变异（跳过随机变异）
+# 精准变异 inode.i_size 字段
 ./target/release/erofs-fuzzer \
     --seeds ./seeds \
     --target inode.i_size \
-    --targeted
+    --strategy boundary
+
+# 使用绝对偏移范围
+./target/release/erofs-fuzzer \
+    --seeds ./seeds \
+    --range 1024:8 \
+    --strategy zero
 ```
 
 ### 支持的目标字段
 
-**超级块字段**：
-- `superblock.magic` - 魔数
-- `superblock.checksum` - 校验和
-- `superblock.blkszbits` - 块大小位数
-- `superblock.rootnid` - 根目录 NID
-- `superblock.meta_blkaddr` - 元数据块地址
-- `superblock.feature_compat` / `feature_incompat` - 特性标志
+**超级块字段** (`struct erofs_super_block`)：
+- `superblock.magic` — 魔数
+- `superblock.checksum` — 校验和
+- `superblock.blkszbits` — 块大小位数
+- `superblock.rootnid` — 根目录 inode 号
+- `superblock.meta_blkaddr` — 元数据块地址
+- `superblock.feature_compat` / `feature_incompat` — 特性标志
 
-**inode 字段**：
-- `inode.i_format` - 格式标志
-- `inode.i_mode` - 文件模式
-- `inode.i_size` - 文件大小
-- `inode.i_uid` / `i_gid` - 用户/组 ID
+**inode 字段** (`struct erofs_inode_compact`)：
+- `inode.i_format` — 格式标志
+- `inode.i_mode` — 文件模式
+- `inode.i_size` — 文件大小
+- `inode.i_uid` / `i_gid` — 用户/组 ID
 
 ### 变异策略
 
-| 策略 | 说明 |
-|------|------|
-| `bitflip` | 翻转随机位（默认） |
-| `arithmetic` | 算术变异（加减小值） |
-| `interesting` | 使用边界值（0, max, min 等） |
-| `boundary` | 使用预定义边界值 |
-| `random` | 随机字节 |
-| `zero` | 填充 0x00 |
-| `max` | 填充 0xFF |
+| 策略 | 说明 | 类比 |
+|------|------|------|
+| `bitflip` | 翻转随机位 | `data[offset] ^= (1 << bit)` |
+| `arithmetic` | 算术变异 | `value += delta` |
+| `interesting` | 边界值 | 使用 0, -1, INT_MAX 等 |
+| `boundary` | 预定义边界值 | 0, 0xFF, 0xFFFF, 0xFFFFFFFF |
+| `random` | 随机字节 | `rand_bytes()` |
+| `zero` | 填充 0x00 | `memset(ptr, 0, size)` |
+| `max` | 填充 0xFF | `memset(ptr, 0xFF, size)` |
 
-### 高级示例
+---
+
+## 输出结果解读
+
+### 目录结构
+
+```
+crashes/
+├── crash-000001a2b3c4d5e6-signal-11.erofs    # 触发崩溃的镜像
+├── crash-000001a2b3c4d5e6-signal-11.log       # 崩溃详情
+├── crash-000002b4c5d6e7f8-kernel-panic.erofs  # 内核崩溃
+├── crash-000002b4c5d6e7f8-kernel-panic.log
+└── ...
+
+corpus/
+├── erofs_input_abc123.erofs   # 发现新路径的输入
+└── ...
+```
+
+### 崩溃类型
+
+| 文件名后缀 | 含义 | 用户态 | 内核态 |
+|-----------|------|--------|--------|
+| `signal-11` | SIGSEGV（段错误） | ✅ | ❌ |
+| `signal-6` | SIGABRT（assert/ASan） | ✅ | ❌ |
+| `asan` | ASan 内存错误 | ✅ | ❌ |
+| `kernel-panic` | 内核崩溃 | ❌ | ✅ |
+| `kernel-oops` | 内核错误 | ❌ | ✅ |
+
+### 分析崩溃
+
+#### 用户态崩溃
 
 ```bash
-# 针对 superblock.meta_blkaddr 字段进行边界值测试
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --target superblock.meta_blkaddr \
-    --before 2 --after 2 \
-    --strategy boundary \
-    --count 5 \
-    --iterations 50000
+# 直接重现
+erofsfuse crashes/crash-xxx-signal-11.erofs /mnt/test
 
-# 针对 inode.i_format 字段进行算术变异
-./target/release/erofs-fuzzer \
-    --seeds ./seeds \
-    --target inode.i_format \
-    --strategy arithmetic \
-    --targeted
+# 使用 GDB 调试
+gdb --args erofsfuse crashes/crash-xxx-signal-11.erofs /mnt/test
+
+# 使用 ASan 获取详细信息
+ASAN_OPTIONS=symbolize=1 ./erofs-utils/fuse/erofsfuse \
+    crashes/crash-xxx-signal-11.erofs /mnt/test
+```
+
+#### 内核态崩溃
+
+```bash
+# 在 QEMU 中重现
+./scripts/run_qemu_test.sh crashes/crash-xxx-kernel-panic.erofs --debug
+
+# 查看完整日志
+cat crashes/crash-xxx-kernel-panic.log
 ```
 
 ---
 
-## 内核态测试
+## 常见问题
 
-内核态测试允许直接测试 Linux 内核的 EROFS 驱动，而不是用户态的 erofsfuse。
-
-### 环境搭建
-
-#### 1. 构建测试内核
+### Q1: erofsfuse 找不到
 
 ```bash
-# 构建带 EROFS 支持和调试选项的内核
-./scripts/build_kernel.sh
+# 方法一：安装系统包
+sudo apt install erofs-utils
 
-# 或指定版本
-KERNEL_VERSION=6.9 ./scripts/build_kernel.sh
+# 方法二：指定完整路径
+./target/release/erofs-fuzzer \
+    --erofsfuse-path /usr/bin/erofsfuse \
+    --seeds ./seeds
 ```
 
-这会：
-- 下载 Linux 内核源码
-- 配置 EROFS 和调试选项（KASAN、KCOV 等）
-- 编译内核 (bzImage)
-- 创建最小根文件系统 (rootfs.cpio.gz)
-
-#### 2. 验证构建
+### Q2: 挂载失败
 
 ```bash
-# 检查生成的文件
-ls -la kernel_build/
+# 检查 FUSE 权限
+ls -la /dev/fuse
 
-# 应该看到:
-# - bzImage       (内核镜像)
-# - rootfs.cpio.gz (根文件系统)
+# 添加用户到 fuse 组
+sudo usermod -aG fuse $USER
+# 注销后重新登录
 ```
 
-### 使用 QEMU 测试
+### Q3: QEMU 测试超时
 
-#### 手动测试单个镜像
+内核启动较慢，增加超时时间：
 
 ```bash
-# 测试单个 EROFS 镜像
-./scripts/run_qemu_test.sh ./seeds/test.erofs
-
-# 指定自定义参数
-KERNEL=./kernel_build/bzImage \
-ROOTFS=./kernel_build/rootfs.cpio.gz \
-MEMORY=1024 \
-TIMEOUT=120 \
-./scripts/run_qemu_test.sh ./crashes/crash-xxx.erofs
-
-# 启用调试输出
-./scripts/run_qemu_test.sh ./test.erofs --debug
+./target/release/erofs-fuzzer \
+    --executor qemu \
+    --timeout 180 \
+    --seeds ./seeds
 ```
 
-#### 检测结果
-
-脚本会自动检测以下内核问题：
-- **Kernel Panic** - 内核崩溃
-- **Kernel Oops** - 内核错误
-- **EROFS Error** - EROFS 相关错误
-- **Call Trace** - 调用栈追踪
-
-### 内核测试要求
-
-测试内核包含以下调试选项：
-
-| 选项 | 说明 |
-|------|------|
-| `CONFIG_EROFS_FS` | EROFS 文件系统支持 |
-| `CONFIG_EROFS_FS_DEBUG` | EROFS 调试输出 |
-| `CONFIG_EROFS_FS_ZIP` | EROFS 压缩支持 |
-| `CONFIG_KASAN` | 内核地址消毒器 |
-| `CONFIG_KCOV` | 代码覆盖率 |
-| `CONFIG_DEBUG_INFO` | 调试符号 |
-| `CONFIG_LOCKDEP` | 锁依赖检测 |
-
-### 自动化内核测试
+### Q4: 编译测试内核失败
 
 ```bash
-# 批量测试崩溃样本
-for crash in ./crashes/*.erofs; do
-    echo "Testing: $crash"
-    ./scripts/run_qemu_test.sh "$crash" --timeout 30
-done
+# 检查磁盘空间（需要约 15GB）
+df -h
+
+# 检查依赖
+sudo apt install flex bison bc libelf-dev libssl-dev
+
+# 手动构建
+cd kernel_build/linux-6.8
+make -j$(nproc) bzImage
 ```
 
-### 与 Fuzzer 集成
+### Q5: 如何查看测试进度？
 
-内核执行器已集成到框架中：
-
-```rust
-use erofs_fuzzer::{QemuKernelExecutor, ExecutorConfig, Executor};
-
-// 创建 QEMU 内核执行器
-let config = ExecutorConfig::qemu(
-    PathBuf::from("./kernel_build/bzImage"),
-    PathBuf::from("./kernel_build/rootfs.cpio.gz"),
-    60000, // 60秒超时
-);
-
-let mut executor = QemuKernelExecutor::new(&config);
-
-// 执行测试
-let result = executor.execute(&input)?;
-if result.is_crash() {
-    println!("Kernel crash detected!");
-}
+```bash
+# 使用 debug 日志级别
+./target/release/erofs-fuzzer \
+    --log-level debug \
+    --seeds ./seeds
 ```
 
-### 内核崩溃分析
+### Q6: 测试速度太慢
 
-崩溃输出示例：
+```bash
+# 减少变异次数
+./target/release/erofs-fuzzer \
+    --mutations-per-input 2 \
+    --seeds ./seeds
 
+# 增加并行度（用户态）
+./target/release/erofs-fuzzer \
+    --workers 4 \
+    --seeds ./seeds
 ```
-==============================================
-QEMU EROFS Test
-==============================================
-Kernel:     ./kernel_build/bzImage
-Rootfs:     ./kernel_build/rootfs.cpio.gz
-Image:      ./crashes/crash-xxx.erofs
-Memory:     512MB
-Timeout:    60s
-==============================================
-
-[    2.345678] Kernel panic - not syncing: EROFS: invalid superblock
-[    2.345679] Call Trace:
-[    2.345680]  erofs_read_superblock+0x150/0x200
-[    2.345681]  erofs_fc_fill_super+0x50/0x300
-[    2.345682]  get_tree_bdev+0x100/0x200
-
-==============================================
-Result: KERNEL PANIC DETECTED
-```
-
-### 常见内核问题
-
-1. **EROFS 超级块验证失败**
-   - magic number 错误
-   - 校验和不匹配
-   - 块大小无效
-
-2. **内存访问错误**
-   - KASAN 检测到越界访问
-   - 空指针解引用
-   - 释放后使用
-
-3. **压缩数据处理**
-   - LZ4 解压错误
-   - 压缩块边界问题
 
 ---
 
-*文档版本：1.2*
-*最后更新：2026-03-27*
+## 项目结构
+
+```
+erofs-image-injector-rs/
+├── erofs-fuzzer/           # 主程序
+│   ├── src/
+│   │   ├── main.rs         # 入口点
+│   │   ├── cli.rs          # 命令行参数
+│   │   ├── fuzzer.rs       # 模糊测试主循环
+│   │   ├── executor.rs     # 用户态执行器
+│   │   └── qemu_executor.rs # 内核态执行器
+│   └── Cargo.toml
+│
+├── erofs-format/           # EROFS 格式定义（类似内核头文件）
+│   ├── src/
+│   │   ├── superblock.rs   # struct erofs_super_block
+│   │   ├── inode.rs        # struct erofs_inode_compact
+│   │   ├── directory.rs    # struct erofs_dirent
+│   │   └── xattr.rs        # 扩展属性
+│   └── Cargo.toml
+│
+├── erofs-mutator/          # 变异器
+│   ├── src/
+│   │   ├── bitflip_mutator.rs
+│   │   ├── superblock_mutator.rs
+│   │   ├── inode_mutator.rs
+│   │   ├── directory_mutator.rs
+│   │   └── xattr_mutator.rs
+│   └── Cargo.toml
+│
+├── scripts/
+│   ├── build_kernel.sh     # 构建测试内核
+│   └── run_qemu_test.sh    # 运行 QEMU 测试
+│
+├── kernel_build/           # 内核构建输出
+│   ├── bzImage             # 测试内核
+│   └── rootfs.cpio.gz      # initramfs
+│
+├── seeds/                  # 种子目录
+├── crashes/                # 崩溃输出
+└── corpus/                 # 语料库
+```
+
+---
+
+## 对比：Rust vs C 语法速查
+
+| Rust | C | 说明 |
+|------|---|------|
+| `let x: i32 = 0;` | `int x = 0;` | 变量声明 |
+| `let mut x = 0;` | `int x = 0;` | 可变变量 |
+| `struct Foo { ... }` | `struct foo { ... };` | 结构体 |
+| `impl Foo { ... }` | `void foo_method() { }` | 方法实现 |
+| `Option<T>` | `T*`（可空） | 可选值 |
+| `Result<T, E>` | 返回值 + errno | 错误处理 |
+| `match x { ... }` | `switch (x) { ... }` | 模式匹配 |
+| `Vec<T>` | `T*` + size | 动态数组 |
+| `cargo build` | `make` | 编译命令 |
+| `cargo test` | `make test` | 测试命令 |
+
+---
+
+*文档版本：2.0*
+*最后更新：2026-03-28*

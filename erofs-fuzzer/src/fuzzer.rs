@@ -19,8 +19,10 @@ use erofs_mutator::{
     ErofsXattrMutator, TargetedMutator, rand_below,
 };
 
-use crate::cli::{CliArgs, FuzzerConfig};
-use crate::executor::{ErofsfuseExecutor, ErofsfuseExit};
+use crate::cli::{CliArgs, FuzzerConfig, ExecutorType};
+use crate::executor::ErofsfuseExecutor;
+use crate::qemu_executor::QemuKernelExecutor;
+use crate::executor_trait::{Executor, ExecutionResult, ExecutorConfig};
 
 /// Fuzzer error types
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +46,34 @@ pub enum FuzzerError {
 
 /// Result type for fuzzer operations
 pub type FuzzerResult<T> = Result<T, FuzzerError>;
+
+/// Unified executor wrapper
+enum FuzzerExecutor {
+    /// User-space erofsfuse executor
+    Erofsfuse(ErofsfuseExecutor),
+    /// QEMU kernel executor
+    QemuKernel(QemuKernelExecutor),
+}
+
+impl FuzzerExecutor {
+    fn execute(&mut self, input: &ErofsImageInput) -> FuzzerResult<ExecutionResult> {
+        match self {
+            FuzzerExecutor::Erofsfuse(e) => {
+                e.execute(input).map_err(|e| FuzzerError::Executor(e.to_string()))
+            }
+            FuzzerExecutor::QemuKernel(e) => {
+                e.execute(input).map_err(|e| FuzzerError::Executor(e.to_string()))
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            FuzzerExecutor::Erofsfuse(_) => "ErofsfuseExecutor",
+            FuzzerExecutor::QemuKernel(_) => "QemuKernelExecutor",
+        }
+    }
+}
 
 /// Run the fuzzer with the given arguments
 pub fn run_fuzzer(args: CliArgs) -> FuzzerResult<()> {
@@ -84,14 +114,6 @@ pub fn run_fuzzer(args: CliArgs) -> FuzzerResult<()> {
 
 /// Validate the fuzzer configuration
 fn validate_config(config: &FuzzerConfig) -> FuzzerResult<()> {
-    // Check erofsfuse exists
-    if !config.erofsfuse_path.exists() {
-        return Err(FuzzerError::Config(format!(
-            "erofsfuse not found at {:?}",
-            config.erofsfuse_path
-        )));
-    }
-
     // Check seeds directory exists
     if !config.seeds_dir.exists() {
         return Err(FuzzerError::Config(format!(
@@ -112,6 +134,41 @@ fn validate_config(config: &FuzzerConfig) -> FuzzerResult<()> {
         return Err(FuzzerError::Config(
             "num_workers must be at least 1".to_string(),
         ));
+    }
+
+    // Check executor-specific requirements
+    match config.executor_type {
+        ExecutorType::Erofsfuse => {
+            if !config.erofsfuse_path.exists() {
+                return Err(FuzzerError::Config(format!(
+                    "erofsfuse not found at {:?}",
+                    config.erofsfuse_path
+                )));
+            }
+        }
+        ExecutorType::QemuKernel => {
+            if !config.kernel_path.exists() {
+                return Err(FuzzerError::Config(format!(
+                    "Kernel not found at {:?}. Run scripts/build_kernel.sh first.",
+                    config.kernel_path
+                )));
+            }
+            if !config.initramfs_path.exists() {
+                return Err(FuzzerError::Config(format!(
+                    "Initramfs not found at {:?}. Run scripts/build_kernel.sh first.",
+                    config.initramfs_path
+                )));
+            }
+            // Check QEMU is in PATH or specified path exists
+            if config.qemu_path.to_str() != Some("qemu-system-x86_64") {
+                if !config.qemu_path.exists() {
+                    return Err(FuzzerError::Config(format!(
+                        "QEMU not found at {:?}",
+                        config.qemu_path
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -226,9 +283,80 @@ fn create_targeted_mutator(config: &FuzzerConfig) -> Option<TargetedMutator> {
     Some(mutator)
 }
 
+/// Create executor based on configuration
+fn create_executor(config: &FuzzerConfig) -> FuzzerResult<FuzzerExecutor> {
+    match config.executor_type {
+        ExecutorType::Erofsfuse => {
+            info!("Using ErofsfuseExecutor");
+            Ok(FuzzerExecutor::Erofsfuse(ErofsfuseExecutor::new(config)))
+        }
+        ExecutorType::QemuKernel => {
+            info!("Using QemuKernelExecutor");
+            info!("Kernel: {:?}", config.kernel_path);
+            info!("Initramfs: {:?}", config.initramfs_path);
+            let executor_config = crate::executor_trait::ExecutorConfig::qemu(
+                config.kernel_path.clone(),
+                config.initramfs_path.clone(),
+                config.timeout_ms,
+            )
+            .with_qemu_path(config.qemu_path.clone())
+            .with_qemu_memory(config.qemu_memory)
+            .with_max_size(config.max_image_size)
+            .with_min_size(config.min_image_size);
+
+            let mut executor = QemuKernelExecutor::new(&executor_config);
+            // Check requirements early
+            executor.check_requirements()
+                .map_err(|e| FuzzerError::Config(e.to_string()))?;
+            Ok(FuzzerExecutor::QemuKernel(executor))
+        }
+    }
+}
+
+/// Handle crash result and save to disk
+fn handle_crash(config: &FuzzerConfig, input: &ErofsImageInput, result: ExecutionResult, iteration: u64, seed_idx: Option<usize>) -> FuzzerResult<()> {
+    let (crash_type, suffix) = match result {
+        ExecutionResult::Crashed(signal) => ("Signal", format!("signal-{}", signal)),
+        ExecutionResult::AsanError => ("ASan", "asan".to_string()),
+        ExecutionResult::KernelPanic => ("KernelPanic", "kernel-panic".to_string()),
+        ExecutionResult::KernelOops => ("KernelOops", "kernel-oops".to_string()),
+        _ => return Ok(()),
+    };
+
+    let prefix = seed_idx.map(|_| "seed-crash").unwrap_or("crash");
+    let timestamp = current_nanos();
+
+    let crash_path = config.output_dir.join(format!(
+        "{}-{:016x}-{}.erofs",
+        prefix, timestamp, suffix
+    ));
+    std::fs::write(&crash_path, input.data())?;
+    info!("Crash ({}) saved to {:?}", crash_type, crash_path);
+
+    let info_path = config.output_dir.join(format!(
+        "{}-{:016x}-{}.log",
+        prefix, timestamp, suffix
+    ));
+    let info = match seed_idx {
+        Some(idx) => format!(
+            "Type: {}\nIteration: 0 (seed)\nSize: {} bytes\nSeed index: {}\n",
+            crash_type, input.len(), idx
+        ),
+        None => format!(
+            "Type: {}\nIteration: {}\nSize: {} bytes\n",
+            crash_type, iteration, input.len()
+        ),
+    };
+    let _ = std::fs::write(&info_path, info);
+
+    Ok(())
+}
+
 /// Simple fuzzer implementation without coverage-guided feedback
 fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> FuzzerResult<()> {
-    let mut executor = ErofsfuseExecutor::new(config);
+    let mut executor = create_executor(config)?;
+    info!("Created executor: {}", executor.name());
+
     let mut iterations = 0u64;
     let mut crashes = 0u64;
 
@@ -252,75 +380,14 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
     info!("Testing {} seed images without mutation...", state.seeds.len());
     for (idx, seed) in state.seeds.iter().enumerate() {
         info!("Testing seed {} of {}", idx + 1, state.seeds.len());
-        match executor.execute_erofs(seed) {
-            Ok(ErofsfuseExit::Crashed(signal)) => {
-                info!("Found crash in seed with signal {}!", signal);
+        match executor.execute(seed) {
+            Ok(result) if result.is_crash() => {
+                info!("Found crash in seed: {:?}", result);
                 crashes += 1;
-
-                // Save crash
-                let crash_path = config.output_dir.join(format!(
-                    "seed-crash-{:016x}-signal-{}.erofs",
-                    current_nanos(),
-                    signal
-                ));
-                std::fs::write(&crash_path, seed.data())?;
-                info!("Crash saved to {:?}", crash_path);
-
-                // Also save crash info
-                let info_path = config.output_dir.join(format!(
-                    "seed-crash-{:016x}-signal-{}.log",
-                    current_nanos(),
-                    signal
-                ));
-                let info = format!(
-                    "Signal: {}\nIteration: 0 (seed)\nSize: {} bytes\nSeed index: {}\n",
-                    signal,
-                    seed.len(),
-                    idx
-                );
-                let _ = std::fs::write(&info_path, info);
+                handle_crash(config, seed, result, 0, Some(idx))?;
             }
-            Ok(ErofsfuseExit::AsanError) => {
-                info!("Found ASan error in seed!");
-                crashes += 1;
-
-                let crash_path = config.output_dir.join(format!(
-                    "seed-crash-{:016x}-asan.erofs",
-                    current_nanos()
-                ));
-                std::fs::write(&crash_path, seed.data())?;
-                info!("ASan crash saved to {:?}", crash_path);
-
-                let info_path = config.output_dir.join(format!(
-                    "seed-crash-{:016x}-asan.log",
-                    current_nanos()
-                ));
-                let info = format!(
-                    "Type: AddressSanitizer Error\nIteration: 0 (seed)\nSize: {} bytes\nSeed index: {}\n",
-                    seed.len(),
-                    idx
-                );
-                let _ = std::fs::write(&info_path, info);
-            }
-            Ok(ErofsfuseExit::Timeout) => {
-                debug!("Seed execution timeout");
-            }
-            Ok(ErofsfuseExit::Error(code)) => {
-                // Check for ASan-related exit codes
-                if code == 134 {
-                    info!("Found ASan crash in seed (exit code 134)!");
-                    crashes += 1;
-
-                    let crash_path = config.output_dir.join(format!(
-                        "seed-crash-{:016x}-asan.erofs",
-                        current_nanos()
-                    ));
-                    std::fs::write(&crash_path, seed.data())?;
-                    info!("Crash saved to {:?}", crash_path);
-                }
-            }
-            Ok(_) => {
-                // Normal execution
+            Ok(result) => {
+                debug!("Seed result: {:?}", result);
             }
             Err(e) => {
                 debug!("Seed execution error: {}", e);
@@ -385,92 +452,32 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
         }
 
         // Execute
-        match executor.execute_erofs(&mutated_input) {
-            Ok(ErofsfuseExit::Crashed(signal)) => {
-                info!("Found crash with signal {}!", signal);
+        match executor.execute(&mutated_input) {
+            Ok(result) if result.is_crash() => {
+                info!("Found crash: {:?}", result);
                 crashes += 1;
-
-                // Save crash
-                let crash_path = config.output_dir.join(format!(
-                    "crash-{:016x}-signal-{}.erofs",
-                    current_nanos(),
-                    signal
-                ));
-                std::fs::write(&crash_path, mutated_input.data())?;
-                info!("Crash saved to {:?}", crash_path);
-
-                // Also save crash info
-                let info_path = config.output_dir.join(format!(
-                    "crash-{:016x}-signal-{}.log",
-                    current_nanos(),
-                    signal
-                ));
-                let info = format!(
-                    "Signal: {}\nIteration: {}\nSize: {} bytes\n",
-                    signal,
-                    iterations,
-                    mutated_input.len()
-                );
-                let _ = std::fs::write(&info_path, info);
+                handle_crash(config, &mutated_input, result, iterations, None)?;
             }
-            Ok(ErofsfuseExit::AsanError) => {
-                info!("Found ASan memory error!");
-                crashes += 1;
-
-                // Save crash
-                let crash_path = config.output_dir.join(format!(
-                    "crash-{:016x}-asan.erofs",
-                    current_nanos()
-                ));
-                std::fs::write(&crash_path, mutated_input.data())?;
-                info!("ASan crash saved to {:?}", crash_path);
-
-                // Also save crash info
-                let info_path = config.output_dir.join(format!(
-                    "crash-{:016x}-asan.log",
-                    current_nanos()
-                ));
-                let info = format!(
-                    "Type: AddressSanitizer Error\nIteration: {}\nSize: {} bytes\n",
-                    iterations,
-                    mutated_input.len()
-                );
-                let _ = std::fs::write(&info_path, info);
-            }
-            Ok(ErofsfuseExit::Timeout) => {
+            Ok(ExecutionResult::Timeout) => {
                 debug!("Execution timeout");
             }
-            Ok(ErofsfuseExit::Error(code)) => {
+            Ok(ExecutionResult::Error(code)) => {
                 // Check for ASan-related exit codes (134 = 128 + 6 = SIGABRT)
                 if code == 134 {
                     info!("Found ASan crash (exit code 134)!");
                     crashes += 1;
-
-                    let crash_path = config.output_dir.join(format!(
-                        "crash-{:016x}-asan.erofs",
-                        current_nanos()
-                    ));
-                    std::fs::write(&crash_path, mutated_input.data())?;
-                    info!("Crash saved to {:?}", crash_path);
-
-                    let info_path = config.output_dir.join(format!(
-                        "crash-{:016x}-asan.log",
-                        current_nanos()
-                    ));
-                    let info = format!(
-                        "ASan crash (exit code 134)\nIteration: {}\nSize: {} bytes\n",
-                        iterations,
-                        mutated_input.len()
-                    );
-                    let _ = std::fs::write(&info_path, info);
+                    handle_crash(config, &mutated_input, ExecutionResult::AsanError, iterations, None)?;
                 }
                 debug!("Execution error: {}", code);
             }
-            Ok(ErofsfuseExit::Success) => {
+            Ok(ExecutionResult::Success) => {
                 // Normal execution - could add to corpus if interesting
             }
-            Ok(ErofsfuseExit::FailedToStart) => {
-                debug!("Failed to start erofsfuse");
+            Ok(ExecutionResult::FailedToStart) => {
+                debug!("Failed to start executor");
+            }
+            Ok(_) => {
+                // Other results
             }
             Err(e) => {
                 debug!("Execution error: {}", e);

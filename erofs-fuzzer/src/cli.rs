@@ -98,6 +98,37 @@ pub struct CliArgs {
     /// Enable targeted-only mode (skip random mutations, only use targeted mutations)
     #[arg(long)]
     pub targeted: bool,
+
+    // ===== QEMU Kernel Testing Arguments =====
+
+    /// Executor type: erofsfuse (default) or qemu
+    #[arg(long, value_enum, default_value = "erofsfuse")]
+    pub executor: ExecutorTypeArg,
+
+    /// Path to kernel bzImage (for QEMU executor)
+    #[arg(long, value_name = "PATH", default_value = "./kernel_build/bzImage")]
+    pub kernel: PathBuf,
+
+    /// Path to initramfs (for QEMU executor)
+    #[arg(long, value_name = "PATH", default_value = "./kernel_build/rootfs.cpio.gz")]
+    pub initramfs: PathBuf,
+
+    /// Path to QEMU binary (for QEMU executor)
+    #[arg(long, value_name = "PATH", default_value = "qemu-system-x86_64")]
+    pub qemu_path: PathBuf,
+
+    /// Memory for QEMU in MB (for QEMU executor)
+    #[arg(long, default_value = "512")]
+    pub qemu_memory: usize,
+}
+
+/// Executor type argument
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExecutorTypeArg {
+    /// User-space erofsfuse testing
+    Erofsfuse,
+    /// QEMU kernel testing
+    Qemu,
 }
 
 /// Configuration derived from CLI arguments
@@ -131,6 +162,16 @@ pub struct FuzzerConfig {
     pub targeted_config: Option<TargetedConfig>,
     /// Targeted-only mode (skip random mutations)
     pub targeted_only: bool,
+    /// Executor type
+    pub executor_type: ExecutorType,
+    /// Path to kernel bzImage (for QEMU)
+    pub kernel_path: PathBuf,
+    /// Path to initramfs (for QEMU)
+    pub initramfs_path: PathBuf,
+    /// Path to QEMU binary
+    pub qemu_path: PathBuf,
+    /// Memory for QEMU in MB
+    pub qemu_memory: usize,
 }
 
 /// Configuration for targeted mutation
@@ -148,6 +189,24 @@ pub struct TargetedConfig {
     pub strategy: String,
     /// Number of mutations
     pub count: usize,
+}
+
+/// Executor type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorType {
+    /// User-space erofsfuse testing
+    Erofsfuse,
+    /// QEMU kernel testing
+    QemuKernel,
+}
+
+impl From<ExecutorTypeArg> for ExecutorType {
+    fn from(arg: ExecutorTypeArg) -> Self {
+        match arg {
+            ExecutorTypeArg::Erofsfuse => ExecutorType::Erofsfuse,
+            ExecutorTypeArg::Qemu => ExecutorType::QemuKernel,
+        }
+    }
 }
 
 impl From<CliArgs> for FuzzerConfig {
@@ -180,6 +239,11 @@ impl From<CliArgs> for FuzzerConfig {
             asan_enabled: args.asan,
             targeted_config,
             targeted_only: args.targeted,
+            executor_type: args.executor.into(),
+            kernel_path: args.kernel,
+            initramfs_path: args.initramfs,
+            qemu_path: args.qemu_path,
+            qemu_memory: args.qemu_memory,
         }
     }
 }
