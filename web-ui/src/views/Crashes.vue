@@ -3,12 +3,14 @@ import { ref, onMounted } from 'vue'
 import { api } from '@/api'
 import type { Crash, CrashType } from '@/types'
 import ReproScriptModal from '@/components/ReproScriptModal.vue'
+import CrashLogModal from '@/components/CrashLogModal.vue'
 
 const crashes = ref<Crash[]>([])
 const loading = ref(true)
 const filterTaskId = ref<number | null>(null)
 const filterType = ref<CrashType | null>(null)
 const showReproModal = ref(false)
+const showLogModal = ref(false)
 const selectedCrashId = ref<number | null>(null)
 
 onMounted(async () => {
@@ -47,6 +49,11 @@ function getCrashTypeClass(type: CrashType): string {
 function showRepro(crashId: number) {
   selectedCrashId.value = crashId
   showReproModal.value = true
+}
+
+function showLog(crashId: number) {
+  selectedCrashId.value = crashId
+  showLogModal.value = true
 }
 </script>
 
@@ -133,6 +140,12 @@ function showRepro(crashId: number) {
                 Download
               </a>
               <button
+                @click="showLog(crash.id)"
+                class="btn btn-secondary text-xs px-2 py-1 mr-1"
+              >
+                Log
+              </button>
+              <button
                 @click="showRepro(crash.id)"
                 class="btn btn-secondary text-xs px-2 py-1"
               >
@@ -149,6 +162,13 @@ function showRepro(crashId: number) {
       v-if="showReproModal && selectedCrashId"
       :crash-id="selectedCrashId"
       @close="showReproModal = false"
+    />
+
+    <!-- Crash Log Modal -->
+    <CrashLogModal
+      v-if="showLogModal && selectedCrashId"
+      :crash-id="selectedCrashId"
+      @close="showLogModal = false"
     />
   </div>
 </template>

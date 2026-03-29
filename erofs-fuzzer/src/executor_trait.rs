@@ -11,7 +11,7 @@ use libafl_bolts::Error;
 use erofs_input::ErofsImageInput;
 
 /// Exit kind for test execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     /// Execution completed successfully
     Success,
@@ -63,6 +63,38 @@ impl ExecutionResult {
             ExecutionResult::KernelOops => "Kernel Oops",
             ExecutionResult::FailedToStart => "Failed to Start",
         }
+    }
+}
+
+/// Execution output including result and logs
+#[derive(Debug, Clone)]
+pub struct ExecutionOutput {
+    /// The execution result
+    pub result: ExecutionResult,
+    /// Kernel log output (for QEMU executor)
+    pub kernel_log: Option<String>,
+}
+
+impl ExecutionOutput {
+    /// Create a new execution output
+    pub fn new(result: ExecutionResult) -> Self {
+        Self {
+            result,
+            kernel_log: None,
+        }
+    }
+
+    /// Create with kernel log
+    pub fn with_log(result: ExecutionResult, log: String) -> Self {
+        Self {
+            result,
+            kernel_log: Some(log),
+        }
+    }
+
+    /// Check if this is a crash
+    pub fn is_crash(&self) -> bool {
+        self.result.is_crash()
     }
 }
 
@@ -176,6 +208,12 @@ impl ExecutorConfig {
 pub trait Executor {
     /// Execute a test with the given EROFS image input
     fn execute(&mut self, input: &ErofsImageInput) -> Result<ExecutionResult, Error>;
+
+    /// Execute a test and return output with logs
+    fn execute_with_output(&mut self, input: &ErofsImageInput) -> Result<ExecutionOutput, Error> {
+        let result = self.execute(input)?;
+        Ok(ExecutionOutput::new(result))
+    }
 
     /// Get the number of executions performed
     fn executions(&self) -> u64;

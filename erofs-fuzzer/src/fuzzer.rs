@@ -2,6 +2,7 @@
 //!
 //! Core fuzzing loop and orchestration.
 
+use std::io::Write;
 use std::num::NonZeroUsize;
 
 use libafl::mutators::Mutator;
@@ -22,7 +23,7 @@ use erofs_mutator::{
 use crate::cli::{CliArgs, FuzzerConfig, ExecutorType};
 use crate::executor::ErofsfuseExecutor;
 use crate::qemu_executor::QemuKernelExecutor;
-use crate::executor_trait::{Executor, ExecutionResult, ExecutorConfig};
+use crate::executor_trait::{Executor, ExecutionResult, ExecutionOutput, ExecutorConfig};
 
 /// Fuzzer error types
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +64,17 @@ impl FuzzerExecutor {
             }
             FuzzerExecutor::QemuKernel(e) => {
                 e.execute(input).map_err(|e| FuzzerError::Executor(e.to_string()))
+            }
+        }
+    }
+
+    fn execute_with_output(&mut self, input: &ErofsImageInput) -> FuzzerResult<ExecutionOutput> {
+        match self {
+            FuzzerExecutor::Erofsfuse(e) => {
+                e.execute_with_output(input).map_err(|e| FuzzerError::Executor(e.to_string()))
+            }
+            FuzzerExecutor::QemuKernel(e) => {
+                e.execute_with_output(input).map_err(|e| FuzzerError::Executor(e.to_string()))
             }
         }
     }
@@ -328,7 +340,7 @@ fn create_executor(config: &FuzzerConfig) -> FuzzerResult<FuzzerExecutor> {
 }
 
 /// Handle crash result and save to disk
-fn handle_crash(config: &FuzzerConfig, input: &ErofsImageInput, result: ExecutionResult, iteration: u64, seed_idx: Option<usize>) -> FuzzerResult<()> {
+fn handle_crash(config: &FuzzerConfig, input: &ErofsImageInput, result: ExecutionResult, iteration: u64, seed_idx: Option<usize>, kernel_log: Option<&str>) -> FuzzerResult<()> {
     let (crash_type, suffix) = match result {
         ExecutionResult::Crashed(signal) => ("Signal", format!("signal-{}", signal)),
         ExecutionResult::AsanError => ("ASan", "asan".to_string()),
@@ -351,7 +363,9 @@ fn handle_crash(config: &FuzzerConfig, input: &ErofsImageInput, result: Executio
         "{}-{:016x}-{}.log",
         prefix, timestamp, suffix
     ));
-    let info = match seed_idx {
+
+    // Build log content with crash info and kernel log
+    let mut info = match seed_idx {
         Some(idx) => format!(
             "Type: {}\nIteration: 0 (seed)\nSize: {} bytes\nSeed index: {}\n",
             crash_type, input.len(), idx
@@ -361,6 +375,15 @@ fn handle_crash(config: &FuzzerConfig, input: &ErofsImageInput, result: Executio
             crash_type, iteration, input.len()
         ),
     };
+
+    // Add kernel log if available
+    if let Some(log) = kernel_log {
+        info.push_str("\n========================================\n");
+        info.push_str("Kernel Log:\n");
+        info.push_str("========================================\n");
+        info.push_str(log);
+    }
+
     let _ = std::fs::write(&info_path, info);
 
     Ok(())
@@ -390,24 +413,46 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
         }
     }
 
+    // Build weighted mutator list from strategy config
+    let weighted_mutators = build_weighted_mutators(config);
+    let total_weight: u32 = weighted_mutators.iter().map(|(_, w)| *w).sum();
+    info!("Loaded {} mutators with total weight {}", weighted_mutators.len(), total_weight);
+    for (name, weight) in &weighted_mutators {
+        info!("  Mutator '{}': weight {} ({:.1}%)", name, weight, (*weight as f64 / total_weight as f64) * 100.0);
+    }
+
+    // Output startup message to stdout for parent process to parse
+    println!("[FUZZER] start seeds={} max_iterations={}", state.seeds.len(), config.max_iterations);
+    let _ = std::io::stdout().flush();
+
+    // Track timing for speed calculation
+    let mut last_progress_time = std::time::Instant::now();
+    let mut last_progress_iterations = 0u64;
+
     // First, test all seeds without mutation to find existing crashes
     info!("Testing {} seed images without mutation...", state.seeds.len());
     for (idx, seed) in state.seeds.iter().enumerate() {
         info!("Testing seed {} of {}", idx + 1, state.seeds.len());
-        match executor.execute(seed) {
-            Ok(result) if result.is_crash() => {
-                info!("Found crash in seed: {:?}", result);
+        println!("[MUTATOR] seed-test-{}", idx + 1);
+        let _ = std::io::stdout().flush();
+        match executor.execute_with_output(seed) {
+            Ok(output) if output.result.is_crash() => {
+                info!("Found crash in seed: {:?}", output.result);
                 crashes += 1;
-                handle_crash(config, seed, result, 0, Some(idx))?;
+                handle_crash(config, seed, output.result, 0, Some(idx), output.kernel_log.as_deref())?;
             }
-            Ok(result) => {
-                debug!("Seed result: {:?}", result);
+            Ok(output) => {
+                debug!("Seed result: {:?}", output.result);
             }
             Err(e) => {
                 debug!("Seed execution error: {}", e);
             }
         }
     }
+
+    // Output progress after seed testing
+    println!("[PROGRESS] iteration=0 crashes={} speed=0.0", crashes);
+    let _ = std::io::stdout().flush();
 
     info!("Starting mutation-based fuzzing...");
 
@@ -432,67 +477,85 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
         // Clone and mutate
         let mut mutated_input = input.clone();
 
-        // Apply mutations
+        // Apply mutations using weighted selection
+        let mut current_mutator_name: Option<&str> = None;
         if config.targeted_only {
             // Targeted-only mode: only use targeted mutator
             if let Some(ref mut tm) = targeted_mutator {
                 for _ in 0..config.mutations_per_input {
                     let _ = tm.mutate(state, &mut mutated_input);
                 }
+                current_mutator_name = Some("targeted");
             }
         } else {
-            // Mixed mode: combine targeted mutations with random mutations
             let num_mutations = 1 + rand_below(state.rand_mut(), config.mutations_per_input);
             for _ in 0..num_mutations {
-                // Use targeted mutator if available, with 30% probability
+                // Use targeted mutator if available, with probability based on its weight
                 if let Some(ref mut tm) = targeted_mutator {
-                    if rand_below(state.rand_mut(), 10) < 3 {
+                    let targeted_weight = weighted_mutators.iter()
+                        .find(|(name, _)| *name == "targeted")
+                        .map(|(_, w)| *w)
+                        .unwrap_or(0);
+
+                    if targeted_weight > 0 && rand_below(state.rand_mut(), total_weight as usize) < targeted_weight as usize {
                         let _ = tm.mutate(state, &mut mutated_input);
+                        current_mutator_name = Some("targeted");
                         continue;
                     }
                 }
 
-                // Otherwise use random mutators
-                let mutation_choice = rand_below(state.rand_mut(), 5);
-                let _ = match mutation_choice {
-                    0 => bitflip_mutator.mutate(state, &mut mutated_input),
-                    1 => sb_mutator.mutate(state, &mut mutated_input),
-                    2 => inode_mutator.mutate(state, &mut mutated_input),
-                    3 => dir_mutator.mutate(state, &mut mutated_input),
-                    4 => xattr_mutator.mutate(state, &mut mutated_input),
-                    _ => bitflip_mutator.mutate(state, &mut mutated_input),
-                };
+                // Select mutator based on weighted random selection
+                current_mutator_name = select_weighted_mutator(
+                    &weighted_mutators,
+                    total_weight,
+                    state,
+                    &mut bitflip_mutator,
+                    &mut sb_mutator,
+                    &mut inode_mutator,
+                    &mut dir_mutator,
+                    &mut xattr_mutator,
+                    &mut mutated_input,
+                );
             }
         }
 
+        // Output current mutator for UI (to stdout for parent process to parse)
+        if let Some(name) = current_mutator_name {
+            println!("[MUTATOR] {}", name);
+            // Flush stdout to ensure it's immediately visible to parent
+            let _ = std::io::stdout().flush();
+        }
+
         // Execute
-        match executor.execute(&mutated_input) {
-            Ok(result) if result.is_crash() => {
-                info!("Found crash: {:?}", result);
+        match executor.execute_with_output(&mutated_input) {
+            Ok(output) if output.result.is_crash() => {
+                info!("Found crash: {:?}", output.result);
                 crashes += 1;
-                handle_crash(config, &mutated_input, result, iterations, None)?;
+                handle_crash(config, &mutated_input, output.result, iterations, None, output.kernel_log.as_deref())?;
             }
-            Ok(ExecutionResult::Timeout) => {
-                debug!("Execution timeout");
-            }
-            Ok(ExecutionResult::Error(code)) => {
-                // Check for ASan-related exit codes (134 = 128 + 6 = SIGABRT)
-                if code == 134 {
-                    info!("Found ASan crash (exit code 134)!");
-                    crashes += 1;
-                    handle_crash(config, &mutated_input, ExecutionResult::AsanError, iterations, None)?;
+            Ok(output) => match output.result {
+                ExecutionResult::Timeout => {
+                    debug!("Execution timeout");
                 }
-                debug!("Execution error: {}", code);
-            }
-            Ok(ExecutionResult::Success) => {
-                // Normal execution - could add to corpus if interesting
-            }
-            Ok(ExecutionResult::FailedToStart) => {
-                debug!("Failed to start executor");
-            }
-            Ok(_) => {
-                // Other results
-            }
+                ExecutionResult::Error(code) => {
+                    // Check for ASan-related exit codes (134 = 128 + 6 = SIGABRT)
+                    if code == 134 {
+                        info!("Found ASan crash (exit code 134)!");
+                        crashes += 1;
+                        handle_crash(config, &mutated_input, ExecutionResult::AsanError, iterations, None, output.kernel_log.as_deref())?;
+                    }
+                    debug!("Execution error: {}", code);
+                }
+                ExecutionResult::Success => {
+                    // Normal execution - could add to corpus if interesting
+                }
+                ExecutionResult::FailedToStart => {
+                    debug!("Failed to start executor");
+                }
+                _ => {
+                    // Other results
+                }
+            },
             Err(e) => {
                 debug!("Execution error: {}", e);
             }
@@ -500,14 +563,140 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
 
         iterations += 1;
 
+        // Output progress periodically (every 10 iterations or every 2 seconds)
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(last_progress_time).as_secs_f64();
+        if iterations % 10 == 0 || elapsed >= 2.0 {
+            let iter_delta = iterations.saturating_sub(last_progress_iterations);
+            let speed = if elapsed > 0.0 {
+                iter_delta as f64 / elapsed
+            } else {
+                0.0
+            };
+            println!("[PROGRESS] iteration={} crashes={} speed={:.2}", iterations, crashes, speed);
+            let _ = std::io::stdout().flush();
+            last_progress_time = now;
+            last_progress_iterations = iterations;
+        }
+
         if iterations % 100 == 0 {
             info!("Iterations: {}, Crashes: {}, Corpus: {}",
                   iterations, crashes, state.seeds.len());
         }
     }
 
+    // Final progress report
+    println!("[PROGRESS] iteration={} crashes={} speed=0.0", iterations, crashes);
+    println!("[FUZZER] finished iterations={} crashes={}", iterations, crashes);
+    let _ = std::io::stdout().flush();
+
     info!("Fuzzing finished. Total iterations: {}, Total crashes: {}", iterations, crashes);
     Ok(())
+}
+
+/// Build weighted mutator list from strategy configuration
+fn build_weighted_mutators(config: &FuzzerConfig) -> Vec<(&'static str, u32)> {
+    let mut mutators = Vec::new();
+
+    // Default weights if no strategy config
+    let defaults = [
+        ("bitflip", 100u32),
+        ("superblock", 100u32),
+        ("inode", 100u32),
+        ("dirent", 100u32),
+        ("xattr", 50u32),
+        ("targeted", 50u32),
+    ];
+
+    if let Some(ref strategy) = config.strategy_config {
+        // Map CLI mutator names to internal names
+        let name_map = [
+            ("bitflip", "bitflip"),
+            ("bit_flip", "bitflip"),
+            ("random", "random"),
+            ("zero", "zero"),
+            ("max", "max"),
+            ("arithmetic", "arithmetic"),
+            ("interesting_values", "interesting_values"),
+            ("boundary", "boundary"),
+            ("superblock", "superblock"),
+            ("inode", "inode"),
+            ("dirent", "dirent"),
+            ("xattr", "xattr"),
+            ("targeted", "targeted"),
+        ];
+
+        for (cli_name, internal_name) in &name_map {
+            // Only include mutators we actually use
+            if !["bitflip", "superblock", "inode", "dirent", "xattr", "targeted"].contains(internal_name) {
+                continue;
+            }
+
+            if let Some(m_config) = strategy.mutators.get(*cli_name) {
+                if m_config.enabled {
+                    mutators.push((*internal_name, m_config.weight));
+                }
+            } else if let Some(m_config) = strategy.mutators.get(*internal_name) {
+                if m_config.enabled {
+                    mutators.push((*internal_name, m_config.weight));
+                }
+            }
+        }
+
+        // If no mutators were enabled, use defaults
+        if mutators.is_empty() {
+            info!("No enabled mutators in strategy config, using defaults");
+            for (name, weight) in defaults {
+                mutators.push((name, weight));
+            }
+        }
+    } else {
+        // Use default weights
+        for (name, weight) in defaults {
+            mutators.push((name, weight));
+        }
+    }
+
+    mutators
+}
+
+/// Select a mutator based on weighted random selection and apply it
+fn select_weighted_mutator(
+    weighted_mutators: &[(&'static str, u32)],
+    total_weight: u32,
+    state: &mut SimpleFuzzerState,
+    bitflip_mutator: &mut ErofsBitflipMutator,
+    sb_mutator: &mut ErofsSuperblockMutator,
+    inode_mutator: &mut ErofsInodeMutator,
+    dir_mutator: &mut ErofsDirectoryMutator,
+    xattr_mutator: &mut ErofsXattrMutator,
+    input: &mut erofs_input::ErofsImageInput,
+) -> Option<&'static str> {
+    if total_weight == 0 || weighted_mutators.is_empty() {
+        return None;
+    }
+
+    // Select based on weighted random
+    let mut choice = rand_below(state.rand_mut(), total_weight as usize) as u32;
+    for (name, weight) in weighted_mutators {
+        if choice < *weight {
+            // Apply this mutator
+            let _ = match *name {
+                "bitflip" => bitflip_mutator.mutate(state, input),
+                "superblock" => sb_mutator.mutate(state, input),
+                "inode" => inode_mutator.mutate(state, input),
+                "dirent" => dir_mutator.mutate(state, input),
+                "xattr" => xattr_mutator.mutate(state, input),
+                _ => return None, // Skip unknown mutators like targeted (handled separately)
+            };
+            return Some(*name);
+        }
+        choice -= weight;
+    }
+
+    // Fallback to bitflip
+    let _ = bitflip_mutator.mutate(state, input);
+    Some("bitflip")
 }
 
 #[cfg(test)]

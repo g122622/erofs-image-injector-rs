@@ -21,7 +21,7 @@ use libafl_bolts::Error;
 
 use erofs_input::ErofsImageInput;
 use crate::cli::FuzzerConfig;
-use crate::executor_trait::{Executor, ExecutionResult};
+use crate::executor_trait::{Executor, ExecutionResult, ExecutionOutput};
 
 /// Exit kind for erofsfuse execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +766,12 @@ impl From<ErofsfuseExit> for ExecutionResult {
 impl Executor for ErofsfuseExecutor {
     fn execute(&mut self, input: &ErofsImageInput) -> Result<ExecutionResult, Error> {
         self.execute_erofs(input).map(|exit| exit.into())
+    }
+
+    fn execute_with_output(&mut self, input: &ErofsImageInput) -> Result<ExecutionOutput, Error> {
+        // ErofsfuseExecutor doesn't capture kernel logs, so return empty
+        let result = self.execute_erofs(input)?;
+        Ok(ExecutionOutput::new(result.into()))
     }
 
     fn executions(&self) -> u64 {

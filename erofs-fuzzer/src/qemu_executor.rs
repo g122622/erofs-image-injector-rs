@@ -15,7 +15,7 @@ use tracing::{debug, error, info, trace, warn};
 use libafl_bolts::Error;
 
 use erofs_input::ErofsImageInput;
-use crate::executor_trait::{ExecutionResult, Executor, ExecutorConfig};
+use crate::executor_trait::{ExecutionOutput, ExecutionResult, Executor, ExecutorConfig};
 use crate::kernel_monitor::KernelMonitor;
 
 /// QEMU-based kernel test executor
@@ -153,7 +153,7 @@ impl QemuKernelExecutor {
     }
 
     /// Execute a test with the given EROFS image
-    fn run_qemu(&self, image_path: &Path) -> Result<ExecutionResult, Error> {
+    fn run_qemu(&self, image_path: &Path) -> Result<ExecutionOutput, Error> {
         let start = Instant::now();
 
         // Build QEMU command
@@ -187,7 +187,7 @@ impl QemuKernelExecutor {
             Ok(child) => child,
             Err(e) => {
                 error!("Failed to start QEMU: {}", e);
-                return Ok(ExecutionResult::FailedToStart);
+                return Ok(ExecutionOutput::new(ExecutionResult::FailedToStart));
             }
         };
 
@@ -200,6 +200,11 @@ impl QemuKernelExecutor {
         let panic_detected_stderr = panic_detected.clone();
         let crash_tx_stdout = crash_tx.clone();
 
+        // Shared log buffer
+        let log_buffer = Arc::new(std::sync::Mutex::new(String::new()));
+        let log_buffer_stdout = log_buffer.clone();
+        let log_buffer_stderr = log_buffer.clone();
+
         // Monitor stdout thread
         let stdout_thread = std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -211,6 +216,15 @@ impl QemuKernelExecutor {
                     Ok(0) => break,
                     Ok(_) => {
                         trace!("QEMU stdout: {}", line.trim());
+                        // Append to log buffer
+                        if let Ok(mut buf) = log_buffer_stdout.lock() {
+                            buf.push_str(&line);
+                            // Limit log size to 1MB
+                            if buf.len() > 1024 * 1024 {
+                                let drain_len = buf.len() - 512 * 1024;
+                                buf.drain(..drain_len);
+                            }
+                        }
                         // Check for kernel panic/oops
                         if let Some(issue) = KernelMonitor::check_line(&line) {
                             info!("Kernel issue detected in stdout: {:?}", issue);
@@ -237,6 +251,10 @@ impl QemuKernelExecutor {
                     Ok(0) => break,
                     Ok(_) => {
                         trace!("QEMU stderr: {}", line.trim());
+                        // Append to log buffer
+                        if let Ok(mut buf) = log_buffer_stderr.lock() {
+                            buf.push_str(&line);
+                        }
                         if let Some(issue) = KernelMonitor::check_line(&line) {
                             info!("Kernel issue detected in stderr: {:?}", issue);
                             panic_detected_stderr.store(true, Ordering::SeqCst);
@@ -265,7 +283,8 @@ impl QemuKernelExecutor {
                     let _ = child.wait();
                     let _ = stdout_thread.join();
                     let _ = stderr_thread.join();
-                    return Ok(result);
+                    let kernel_log = log_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+                    return Ok(ExecutionOutput::with_log(result, kernel_log));
                 }
                 _ => {}
             }
@@ -278,10 +297,11 @@ impl QemuKernelExecutor {
                         // Process exited
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
+                        let kernel_log = log_buffer.lock().map(|b| b.clone()).unwrap_or_default();
 
                         // Check if we detected a panic
                         if panic_detected.load(Ordering::SeqCst) {
-                            return Ok(ExecutionResult::KernelPanic);
+                            return Ok(ExecutionOutput::with_log(ExecutionResult::KernelPanic, kernel_log));
                         }
 
                         // Check exit status
@@ -290,22 +310,22 @@ impl QemuKernelExecutor {
                             use std::os::unix::process::ExitStatusExt;
                             if let Some(signal) = status.signal() {
                                 info!("QEMU terminated by signal {}", signal);
-                                return Ok(ExecutionResult::Crashed(signal));
+                                return Ok(ExecutionOutput::with_log(ExecutionResult::Crashed(signal), kernel_log));
                             }
                         }
 
                         match status.code() {
                             Some(0) => {
                                 debug!("QEMU exited successfully");
-                                return Ok(ExecutionResult::Success);
+                                return Ok(ExecutionOutput::with_log(ExecutionResult::Success, kernel_log));
                             }
                             Some(code) => {
                                 debug!("QEMU exited with code {}", code);
-                                return Ok(ExecutionResult::Error(code));
+                                return Ok(ExecutionOutput::with_log(ExecutionResult::Error(code), kernel_log));
                             }
                             None => {
                                 debug!("QEMU exited without status");
-                                return Ok(ExecutionResult::Error(-1));
+                                return Ok(ExecutionOutput::with_log(ExecutionResult::Error(-1), kernel_log));
                             }
                         }
                     }
@@ -325,11 +345,12 @@ impl QemuKernelExecutor {
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
+                let kernel_log = log_buffer.lock().map(|b| b.clone()).unwrap_or_default();
 
                 if panic_detected.load(Ordering::SeqCst) {
-                    return Ok(ExecutionResult::KernelPanic);
+                    return Ok(ExecutionOutput::with_log(ExecutionResult::KernelPanic, kernel_log));
                 }
-                return Ok(ExecutionResult::Timeout);
+                return Ok(ExecutionOutput::with_log(ExecutionResult::Timeout, kernel_log));
             }
 
             std::thread::sleep(Duration::from_millis(10));
@@ -339,6 +360,11 @@ impl QemuKernelExecutor {
 
 impl Executor for QemuKernelExecutor {
     fn execute(&mut self, input: &ErofsImageInput) -> Result<ExecutionResult, Error> {
+        let output = self.execute_with_output(input)?;
+        Ok(output.result)
+    }
+
+    fn execute_with_output(&mut self, input: &ErofsImageInput) -> Result<ExecutionOutput, Error> {
         self.executions += 1;
 
         // Check requirements on first execution
@@ -351,11 +377,11 @@ impl Executor for QemuKernelExecutor {
         // Validate size
         if data.len() < self.min_size {
             trace!("Input too small: {} < {}", data.len(), self.min_size);
-            return Ok(ExecutionResult::Error(0));
+            return Ok(ExecutionOutput::new(ExecutionResult::Error(0)));
         }
         if data.len() > self.max_size {
             trace!("Input too large: {} > {}", data.len(), self.max_size);
-            return Ok(ExecutionResult::Error(0));
+            return Ok(ExecutionOutput::new(ExecutionResult::Error(0)));
         }
 
         // Create temporary file for the image
@@ -368,7 +394,7 @@ impl Executor for QemuKernelExecutor {
 
         debug!("Testing EROFS image: {:?}", image_path);
 
-        let result = self.run_qemu(&image_path);
+        let output = self.run_qemu(&image_path);
 
         // Clean up
         if !self.keep_temp {
@@ -377,7 +403,7 @@ impl Executor for QemuKernelExecutor {
             self.temp_dir = Some(temp_dir.into_path());
         }
 
-        result
+        output
     }
 
     fn executions(&self) -> u64 {

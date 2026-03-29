@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info};
 
 use crate::db::Database;
+use crate::strategy::StrategyStorage;
 use crate::types::*;
 
 pub use queue::TaskQueue;
@@ -26,7 +27,7 @@ pub enum TaskEvent {
     /// Task status changed
     StatusChanged { task_id: i64, status: TaskStatus },
     /// Task progress updated
-    Progress { task_id: i64, iteration: u64, crashes: u64, speed: f64 },
+    Progress { task_id: i64, iteration: u64, crashes: u64, speed: f64, current_mutator: Option<String> },
     /// Crash was found
     CrashFound { task_id: i64, crash_id: i64, crash_type: CrashType, iteration: u64 },
     /// Task finished
@@ -40,6 +41,8 @@ pub enum TaskEvent {
 pub struct TaskManager {
     /// Database
     db: Database,
+    /// Strategy storage
+    strategy_storage: StrategyStorage,
     /// Task queue
     queue: Arc<Mutex<TaskQueue>>,
     /// Running tasks (task_id -> cancel sender)
@@ -65,9 +68,12 @@ impl TaskManager {
     /// Create a new task manager
     pub fn new(db: Database) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let strategy_storage = StrategyStorage::with_default_path()
+            .expect("Failed to initialize strategy storage");
 
         Self {
             db,
+            strategy_storage,
             queue: Arc::new(Mutex::new(TaskQueue::new())),
             running: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -78,9 +84,12 @@ impl TaskManager {
     /// Create task manager with custom concurrency limit
     pub fn with_concurrency(db: Database, max_concurrent: usize) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let strategy_storage = StrategyStorage::with_default_path()
+            .expect("Failed to initialize strategy storage");
 
         Self {
             db,
+            strategy_storage,
             queue: Arc::new(Mutex::new(TaskQueue::new())),
             running: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -440,12 +449,13 @@ impl TaskManager {
 
         // Clone necessary components
         let db = self.db.clone();
+        let strategy_storage = self.strategy_storage.clone();
         let event_tx = self.event_tx.clone();
         let running = self.running.clone();
 
         // Spawn task runner
         tokio::spawn(async move {
-            let runner = TaskRunner::new(task.clone(), db.clone(), event_tx.clone(), control_rx);
+            let runner = TaskRunner::new(task.clone(), db.clone(), strategy_storage, event_tx.clone(), control_rx);
 
             match runner.run().await {
                 Ok(final_status) => {

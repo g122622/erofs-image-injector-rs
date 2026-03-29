@@ -138,6 +138,13 @@ pub struct CliArgs {
     /// Maximum concurrent tasks in web console
     #[arg(long, default_value = "4")]
     pub web_max_tasks: usize,
+
+    // ===== Strategy Configuration =====
+
+    /// Strategy configuration as JSON string (for web console integration)
+    /// Format: {"mutators":{"bitflip":{"enabled":true,"weight":100},...}}
+    #[arg(long, value_name = "JSON")]
+    pub strategy_config: Option<String>,
 }
 
 /// Executor type argument
@@ -190,6 +197,24 @@ pub struct FuzzerConfig {
     pub qemu_path: PathBuf,
     /// Memory for QEMU in MB
     pub qemu_memory: usize,
+    /// Strategy configuration (mutator weights)
+    pub strategy_config: Option<StrategyConfig>,
+}
+
+/// Mutator configuration for strategy
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MutatorConfig {
+    /// Whether this mutator is enabled
+    pub enabled: bool,
+    /// Weight for selection probability
+    pub weight: u32,
+}
+
+/// Strategy configuration for mutator selection
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct StrategyConfig {
+    /// Mutator configurations: key is mutator name (bitflip, superblock, inode, dirent, xattr, targeted)
+    pub mutators: std::collections::HashMap<String, MutatorConfig>,
 }
 
 /// Configuration for targeted mutation
@@ -242,6 +267,20 @@ impl From<CliArgs> for FuzzerConfig {
             None
         };
 
+        // Parse strategy config from JSON string
+        let strategy_config = args.strategy_config.and_then(|json| {
+            match serde_json::from_str::<StrategyConfig>(&json) {
+                Ok(config) => {
+                    tracing::info!("Loaded strategy config with {} mutators", config.mutators.len());
+                    Some(config)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse strategy config: {}, using defaults", e);
+                    None
+                }
+            }
+        });
+
         Self {
             seeds_dir: args.seeds,
             output_dir: args.output,
@@ -262,6 +301,7 @@ impl From<CliArgs> for FuzzerConfig {
             initramfs_path: args.initramfs,
             qemu_path: args.qemu_path,
             qemu_memory: args.qemu_memory,
+            strategy_config,
         }
     }
 }

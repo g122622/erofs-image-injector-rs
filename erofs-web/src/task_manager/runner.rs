@@ -14,6 +14,7 @@ use nix::sys::signal::{kill as send_signal, Signal};
 use nix::unistd::Pid;
 
 use crate::db::Database;
+use crate::strategy::StrategyStorage;
 use crate::task_manager::ControlMessage;
 use crate::task_manager::TaskEvent;
 use crate::types::*;
@@ -24,6 +25,8 @@ pub struct TaskRunner {
     task: Task,
     /// Database
     db: Database,
+    /// Strategy storage
+    strategy_storage: StrategyStorage,
     /// Event broadcaster
     event_tx: broadcast::Sender<TaskEvent>,
     /// Control channel
@@ -32,6 +35,18 @@ pub struct TaskRunner {
     paused: bool,
     /// Known crash files (to avoid re-recording)
     known_crashes: HashSet<String>,
+    /// Current mutator being used (parsed from fuzzer output)
+    current_mutator: Option<String>,
+    /// Current iteration (parsed from fuzzer output)
+    current_iteration: u64,
+    /// Current crash count (parsed from fuzzer output)
+    current_crashes: u64,
+    /// Current speed (parsed from fuzzer output)
+    current_speed: f64,
+    /// Total seeds count (parsed from fuzzer output)
+    total_seeds: usize,
+    /// Max iterations (parsed from fuzzer output)
+    max_iterations: u64,
 }
 
 impl TaskRunner {
@@ -39,16 +54,24 @@ impl TaskRunner {
     pub fn new(
         task: Task,
         db: Database,
+        strategy_storage: StrategyStorage,
         event_tx: broadcast::Sender<TaskEvent>,
         control_rx: mpsc::Receiver<ControlMessage>,
     ) -> Self {
         Self {
             task,
             db,
+            strategy_storage,
             event_tx,
             control_rx,
             paused: false,
             known_crashes: HashSet::new(),
+            current_mutator: None,
+            current_iteration: 0,
+            current_crashes: 0,
+            current_speed: 0.0,
+            total_seeds: 0,
+            max_iterations: 0,
         }
     }
 
@@ -77,20 +100,72 @@ impl TaskRunner {
         // Spawn real fuzzer subprocess (same executable, without --web)
         let mut child = self.spawn_fuzzer_process().await?;
 
-        // Track progress/heartbeat
-        let mut iteration: u64 = self.task.current_iteration;
-        let start_time = Instant::now();
         let mut last_update = Instant::now();
-        let mut last_progress_iteration = iteration;
-        let mut last_progress_time = start_time;
-        let mut total_crashes: u64 = self.task.total_crashes;
+
+        // Spawn a task to read stdout and extract mutator info
+        let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(64);
+        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let task_id = self.task.id;
+        let stdout_task = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                // Send line to channel for processing
+                if stdout_tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+            info!("[Task {}] Stdout reader finished", task_id);
+        });
 
         loop {
+            // Process stdout lines for progress and mutator info
+            while let Ok(line) = stdout_rx.try_recv() {
+                // Parse progress: [PROGRESS] iteration=N crashes=N speed=F
+                if line.starts_with("[PROGRESS]") {
+                    // Parse: [PROGRESS] iteration=123 crashes=5 speed=1.50
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    for part in parts {
+                        if let Some(val) = part.strip_prefix("iteration=") {
+                            self.current_iteration = val.parse().unwrap_or(self.current_iteration);
+                        } else if let Some(val) = part.strip_prefix("crashes=") {
+                            self.current_crashes = val.parse().unwrap_or(self.current_crashes);
+                        } else if let Some(val) = part.strip_prefix("speed=") {
+                            self.current_speed = val.parse().unwrap_or(self.current_speed);
+                        }
+                    }
+                    debug!("[Task {}] Progress from fuzzer: iter={}, crashes={}, speed={}",
+                           self.task.id, self.current_iteration, self.current_crashes, self.current_speed);
+                }
+                // Parse fuzzer start: [FUZZER] start seeds=N max_iterations=N
+                else if line.starts_with("[FUZZER] start") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    for part in parts {
+                        if let Some(val) = part.strip_prefix("seeds=") {
+                            self.total_seeds = val.parse().unwrap_or(0);
+                        } else if let Some(val) = part.strip_prefix("max_iterations=") {
+                            self.max_iterations = val.parse().unwrap_or(0);
+                        }
+                    }
+                    info!("[Task {}] Fuzzer started: seeds={}, max_iterations={}",
+                          self.task.id, self.total_seeds, self.max_iterations);
+                }
+                // Parse mutator: [MUTATOR] xxx
+                else if line.contains("[MUTATOR]") {
+                    if let Some(mutator) = line.split("[MUTATOR]").nth(1) {
+                        let mutator = mutator.trim().to_string();
+                        debug!("[Task {}] Mutator: {}", self.task.id, mutator);
+                        self.current_mutator = Some(mutator);
+                    }
+                }
+            }
+
             while let Ok(msg) = self.control_rx.try_recv() {
                 match msg {
                     ControlMessage::Stop => {
                         self.stop_child(&mut child).await;
-                        info!("Task {} stopped at iteration {}", self.task.id, iteration);
+                        let _ = stdout_task.await;
+                        info!("Task {} stopped at iteration {}", self.task.id, self.current_iteration);
                         return Ok(TaskStatus::Cancelled);
                     }
                     ControlMessage::Pause => {
@@ -106,18 +181,29 @@ impl TaskRunner {
 
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    // Scan for new crashes one final time
-                    let new_crashes = self.scan_for_new_crashes(iteration).await?;
-                    total_crashes += new_crashes as u64;
+                    // Drain remaining stdout
+                    while let Ok(line) = stdout_rx.try_recv() {
+                        if line.starts_with("[PROGRESS]") {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            for part in parts {
+                                if let Some(val) = part.strip_prefix("iteration=") {
+                                    self.current_iteration = val.parse().unwrap_or(self.current_iteration);
+                                } else if let Some(val) = part.strip_prefix("crashes=") {
+                                    self.current_crashes = val.parse().unwrap_or(self.current_crashes);
+                                } else if let Some(val) = part.strip_prefix("speed=") {
+                                    self.current_speed = val.parse().unwrap_or(self.current_speed);
+                                }
+                            }
+                        } else if line.contains("[MUTATOR]") {
+                            if let Some(mutator) = line.split("[MUTATOR]").nth(1) {
+                                self.current_mutator = Some(mutator.trim().to_string());
+                            }
+                        }
+                    }
+                    let _ = stdout_task.await;
 
-                    // Final progress flush before returning
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let speed = if elapsed > 0.0 {
-                        iteration as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-                    self.update_progress(iteration, total_crashes, speed).await?;
+                    // Final progress update using actual fuzzer data
+                    self.update_progress(self.current_iteration, self.current_crashes, self.current_speed).await?;
 
                     if status.success() {
                         info!(
@@ -137,36 +223,16 @@ impl TaskRunner {
                     // still running
                 }
                 Err(e) => {
+                    let _ = stdout_task.await;
                     return Err(format!("Failed to poll fuzzer process: {}", e));
                 }
             }
 
-            // Heartbeat/progress update periodically.
-            // We cannot read exact iteration from subprocess yet, so approximate by elapsed time.
-            // This avoids the old misleading instant completion behavior while keeping UI responsive.
+            // Update progress periodically using real data from fuzzer
             if last_update.elapsed() > Duration::from_secs(1) {
-                // Conservative synthetic progress estimate for UI only.
-                // Uses +1 tick/sec and real crash count from output directory.
-                if !self.paused {
-                    iteration = iteration.saturating_add(1);
-                }
-
-                // Scan for new crashes
-                let new_crashes = self.scan_for_new_crashes(iteration).await?;
-                total_crashes += new_crashes as u64;
-
-                let now = Instant::now();
-                let dt = now.duration_since(last_progress_time).as_secs_f64();
-                let speed = if dt > 0.0 {
-                    (iteration.saturating_sub(last_progress_iteration)) as f64 / dt
-                } else {
-                    0.0
-                };
-
-                self.update_progress(iteration, total_crashes, speed).await?;
+                // Use actual values from fuzzer output
+                self.update_progress(self.current_iteration, self.current_crashes, self.current_speed).await?;
                 last_update = Instant::now();
-                last_progress_iteration = iteration;
-                last_progress_time = now;
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -415,9 +481,44 @@ impl TaskRunner {
             }
         }
 
+        // Load strategy configuration and pass to fuzzer
+        if let Some(strategy_id) = self.task.strategy_id {
+            if let Some(strategy) = self.strategy_storage.get(strategy_id).await {
+                // Build strategy config JSON for fuzzer
+                let mut mutators = std::collections::HashMap::new();
+                for (mutator_type, config) in &strategy.mutators {
+                    if config.enabled {
+                        mutators.insert(
+                            mutator_type.to_string(),
+                            serde_json::json!({
+                                "enabled": true,
+                                "weight": config.weight
+                            })
+                        );
+                    }
+                }
+
+                let strategy_json = serde_json::to_string(&serde_json::json!({
+                    "mutators": mutators
+                })).map_err(|e| format!("Failed to serialize strategy: {}", e))?;
+
+                cmd.arg("--strategy-config").arg(&strategy_json);
+                info!("[Task {}] Using strategy '{}' (id={}): {} mutators enabled",
+                      self.task.id, strategy.name, strategy_id, mutators.len());
+            } else {
+                warn!("[Task {}] Strategy {} not found, using defaults", self.task.id, strategy_id);
+            }
+        }
+
         debug!("Spawning fuzz subprocess for task {}", self.task.id);
-        cmd.spawn()
-            .map_err(|e| format!("Failed to spawn fuzz subprocess: {}", e))
+        // Capture stdout to parse mutator info
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        info!("[Task {}] Fuzzer command: {:?}", self.task.id, cmd);
+        let child = cmd.spawn()
+            .map_err(|e| format!("Failed to spawn fuzz subprocess: {}", e))?;
+        info!("[Task {}] Fuzzer process spawned with pid {:?}", self.task.id, child.id());
+        Ok(child)
     }
 
     async fn stop_child(&self, child: &mut tokio::process::Child) {
@@ -449,11 +550,15 @@ impl TaskRunner {
         self.db.update_task_progress(self.task.id, iteration, crashes, speed).await
             .map_err(|e| format!("Failed to update progress: {}", e))?;
 
+        info!("[Task {}] Progress: iter={}, crashes={}, speed={}, mutator={:?}",
+              self.task.id, iteration, crashes, speed, self.current_mutator);
+
         let _ = self.event_tx.send(TaskEvent::Progress {
             task_id: self.task.id,
             iteration,
             crashes,
             speed,
+            current_mutator: self.current_mutator.clone(),
         });
 
         Ok(())

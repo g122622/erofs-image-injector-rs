@@ -133,12 +133,13 @@ fn event_to_message(event: &TaskEvent) -> String {
                 status: *status,
             }
         }
-        TaskEvent::Progress { task_id, iteration, crashes, speed } => {
+        TaskEvent::Progress { task_id, iteration, crashes, speed, current_mutator } => {
             ServerMessage::Progress {
                 task_id: *task_id,
                 iteration: *iteration,
                 crashes: *crashes,
                 speed: *speed,
+                current_mutator: current_mutator.clone(),
             }
         }
         TaskEvent::CrashFound { task_id, crash_id, crash_type, iteration } => {

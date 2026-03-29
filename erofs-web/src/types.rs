@@ -300,6 +300,8 @@ pub enum ServerMessage {
         iteration: u64,
         crashes: u64,
         speed: f64,
+        /// Current mutator being used
+        current_mutator: Option<String>,
     },
     /// New crash found
     Crash {

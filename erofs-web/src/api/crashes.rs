@@ -87,6 +87,55 @@ pub async fn get_crash_image(
     ))
 }
 
+/// Get crash log file
+pub async fn get_crash_log(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<(StatusCode, [(header::HeaderName, &'static str); 2], String), (StatusCode, Json<ErrorResponse>)> {
+    debug!("Getting crash log {}", id);
+
+    let crash = state.db.get_crash(id).await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::from(e.to_string())))
+        })?
+        .ok_or_else(|| {
+            (StatusCode::NOT_FOUND, Json(ErrorResponse::from("Crash not found")))
+        })?;
+
+    // Check if log_path is set
+    let log_path = match &crash.log_path {
+        Some(path) => PathBuf::from(path),
+        None => {
+            // Try to find log file by image path convention
+            let image_path = PathBuf::from(&crash.image_path);
+            let log_path = image_path.with_extension("erofs.log");
+            if log_path.exists() {
+                log_path
+            } else {
+                return Err((StatusCode::NOT_FOUND, Json(ErrorResponse::from("No log file available"))));
+            }
+        }
+    };
+
+    if !log_path.exists() {
+        return Err((StatusCode::NOT_FOUND, Json(ErrorResponse::from("Log file not found"))));
+    }
+
+    let content = fs::read_to_string(&log_path)
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::from(format!("Failed to read log: {}", e))))
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, "inline"),
+        ],
+        content,
+    ))
+}
+
 /// Get reproduction script for a crash
 pub async fn get_crash_repro(
     State(state): State<ApiState>,
@@ -119,13 +168,17 @@ pub async fn get_crash_repro(
 
 /// Generate reproduction script for a crash
 fn generate_repro_script(crash: &Crash, task: &Task) -> ReproductionScript {
-    let image_path = &crash.image_path;
+    // Convert image path to absolute path
+    let image_path = std::fs::canonicalize(&crash.image_path)
+        .unwrap_or_else(|_| PathBuf::from(&crash.image_path));
+    let image_path_str = image_path.to_string_lossy();
 
     let script = match task.executor_type {
         ExecutorType::Erofsfuse => {
             format!(
                 r#"#!/bin/bash
 # Reproduction script for crash #{} ({})
+# Image: {}
 
 IMAGE="{}"
 MOUNT_POINT="/tmp/erofs-repro-$$"
@@ -147,77 +200,76 @@ rmdir "$MOUNT_POINT"
 
 exit $EXIT_CODE
 "#,
-                crash.id, crash.crash_type, image_path
+                crash.id, crash.crash_type, image_path_str, image_path_str
             )
         }
         ExecutorType::Qemu => {
-            let kernel = task.kernel_path.as_deref().unwrap_or("./kernel_build/bzImage");
-            let initramfs = task.initramfs_path.as_deref().unwrap_or("./kernel_build/rootfs.cpio.gz");
+            // Convert kernel and initramfs paths to absolute paths
+            let kernel = task.kernel_path.as_deref()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
+                .unwrap_or_else(|| PathBuf::from("./kernel_build/bzImage"));
+            let initramfs = task.initramfs_path.as_deref()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
+                .unwrap_or_else(|| PathBuf::from("./kernel_build/rootfs.cpio.gz"));
             let memory = task.qemu_memory.unwrap_or(512);
 
             format!(
                 r#"#!/bin/bash
 # Reproduction script for crash #{} ({})
+# Image: {}
+
+set -e
 
 IMAGE="{}"
 KERNEL="{}"
 INITRAMFS="{}"
 MEMORY="{}"
 
-# Create temporary initramfs with the crash image
-TEMP_DIR=$(mktemp -d)
-TEMP_INITRAMFS="$TEMP_DIR/rootfs.cpio.gz"
+# Verify files exist
+if [ ! -f "$IMAGE" ]; then
+    echo "Error: Crash image not found: $IMAGE"
+    exit 1
+fi
+if [ ! -f "$KERNEL" ]; then
+    echo "Error: Kernel not found: $KERNEL"
+    exit 1
+fi
+if [ ! -f "$INITRAMFS" ]; then
+    echo "Error: Initramfs not found: $INITRAMFS"
+    exit 1
+fi
 
-# Create a basic init script
-cat > "$TEMP_DIR/init" << 'EOF'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev
-
+echo "=========================================="
 echo "Reproducing crash #{} ({})"
-echo "Looking for EROFS image device..."
-
-for dev in /dev/vd* /dev/sd* /dev/hd*; do
-    if [ -b "$dev" ]; then
-        echo "Found block device: $dev"
-        echo "Attempting to mount as EROFS..."
-        if mount -t erofs "$dev" /mnt 2>&1; then
-            echo "Mounted successfully. Listing contents:"
-            ls -la /mnt/
-            echo ""
-            echo "Traversing filesystem..."
-            find /mnt -type f 2>/dev/null | head -20
-            umount /mnt
-        fi
-    fi
-done
-
+echo "Image: $IMAGE"
+echo "Kernel: $KERNEL"
+echo "Initramfs: $INITRAMFS"
+echo "=========================================="
 echo ""
-echo "Test complete. Powering off."
-exec busybox poweroff -f
-EOF
-chmod +x "$TEMP_DIR/init"
+echo "The kernel will boot and attempt to mount the EROFS image."
+echo "Watch for kernel messages indicating the crash."
+echo ""
+echo "Press Ctrl+A then X to exit QEMU."
+echo ""
 
-# Pack the initramfs
-cd "$TEMP_DIR"
-echo "Creating custom initramfs..."
-(find . | cpio -o -H newc 2>/dev/null | gzip) > "$TEMP_INITRAMFS"
-
-# Run QEMU
-echo "Running QEMU with crash image..."
+# Run QEMU directly with the crash image
+# The existing initramfs should handle mounting and testing
 qemu-system-x86_64 \
     -kernel "$KERNEL" \
-    -initrd "$TEMP_INITRAMFS" \
+    -initrd "$INITRAMFS" \
     -m "$MEMORY" \
-    -drive file="$IMAGE",format=raw,if=virtio \
+    -drive file="$IMAGE",format=raw,if=virtio,read-only=on \
     -nographic \
-    -append "console=ttyS0"
+    -append "console=ttyS0 quiet"
 
-# Cleanup
-rm -rf "$TEMP_DIR"
+echo ""
+echo "QEMU exited with code: $?"
 "#,
-                crash.id, crash.crash_type, image_path, kernel, initramfs, memory,
+                crash.id, crash.crash_type, image_path_str,
+                image_path_str,
+                kernel.to_string_lossy(),
+                initramfs.to_string_lossy(),
+                memory,
                 crash.id, crash.crash_type
             )
         }

@@ -55,6 +55,7 @@ function connectWebSocket() {
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data)
+      console.log('WebSocket message:', msg)
       if (msg.type === 'strategy_stats' && msg.task_id === taskId.value) {
         mutatorStats.value = msg.stats.mutators
       } else if (msg.type === 'progress' && msg.task_id === taskId.value) {
@@ -62,6 +63,10 @@ function connectWebSocket() {
           task.value.current_iteration = msg.iteration
           task.value.total_crashes = msg.crashes
           task.value.exec_per_sec = msg.speed
+          if (msg.current_mutator) {
+            console.log('Received current_mutator:', msg.current_mutator)
+            task.value.current_mutator = msg.current_mutator
+          }
         }
       } else if (msg.type === 'status' && msg.task_id === taskId.value) {
         if (task.value) {
@@ -139,7 +144,7 @@ const totalCrashesFromStats = computed(() => {
       </div>
 
       <!-- Stats -->
-      <div class="grid grid-cols-4 gap-4">
+      <div class="grid grid-cols-5 gap-4">
         <div class="card p-4">
           <div class="text-terminal-muted text-sm">Iterations</div>
           <div class="text-xl font-bold">{{ task.current_iteration.toLocaleString() }}</div>
@@ -155,6 +160,12 @@ const totalCrashesFromStats = computed(() => {
         <div class="card p-4">
           <div class="text-terminal-muted text-sm">Executor</div>
           <div class="text-xl font-bold">{{ task.executor_type }}</div>
+        </div>
+        <div class="card p-4">
+          <div class="text-terminal-muted text-sm">Current Mutator</div>
+          <div class="text-xl font-bold text-terminal-accent">
+            {{ task.current_mutator ? getMutatorName(task.current_mutator) : '-' }}
+          </div>
         </div>
       </div>
 

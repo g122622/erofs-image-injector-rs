@@ -12,7 +12,7 @@ fn main() {
     // Parse command line arguments
     let args = CliArgs::parse();
 
-    // Initialize logging
+    // Initialize logging - write to stderr so stdout can be used for machine-readable output
     let log_level = match args.log_level.as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
@@ -26,6 +26,7 @@ fn main() {
         .with_max_level(log_level)
         .with_target(false)
         .with_thread_ids(false)
+        .with_writer(std::io::stderr)  // Write logs to stderr
         .pretty()
         .init();
 

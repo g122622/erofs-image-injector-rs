@@ -158,6 +158,7 @@ export interface Task {
   current_iteration: number
   total_crashes: number
   exec_per_sec: number
+  current_mutator?: string
   created_at: string
   started_at?: string
   finished_at?: string
@@ -194,6 +195,7 @@ export interface ProgressMessage {
   iteration: number
   crashes: number
   speed: number
+  current_mutator?: string
 }
 
 export interface StatusMessage {

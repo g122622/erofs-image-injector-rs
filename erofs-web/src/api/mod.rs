@@ -41,6 +41,7 @@ pub fn create_router() -> Router<ApiState> {
         .route("/api/crashes", get(list_crashes))
         .route("/api/crashes/:id", get(get_crash))
         .route("/api/crashes/:id/image", get(get_crash_image))
+        .route("/api/crashes/:id/log", get(get_crash_log))
         .route("/api/crashes/:id/repro", get(get_crash_repro))
         // Strategy endpoints
         .route("/api/strategies", get(list_strategies).post(create_strategy))
