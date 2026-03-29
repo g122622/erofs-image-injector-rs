@@ -328,10 +328,19 @@ where
             .injection_points()
             .iter()
             .filter_map(|p| {
-                if let erofs_input::InjectionPoint::Inode { offset, layout, .. } = p {
-                    Some((*offset, *layout))
-                } else {
-                    None
+                match p {
+                    erofs_input::InjectionPoint::Inode { offset, layout, .. } => {
+                        Some((*offset, *layout))
+                    }
+                    erofs_input::InjectionPoint::Raw { offset, length, .. } => {
+                        let layout = if *length >= std::mem::size_of::<ErofsInodeExtended>() {
+                            InodeLayout::Extended
+                        } else {
+                            InodeLayout::Compact
+                        };
+                        Some((*offset, layout))
+                    }
+                    _ => None,
                 }
             })
             .collect();
@@ -352,7 +361,20 @@ where
         }
 
         // Select a random inode to mutate
-        let (offset, layout) = inode_offsets[rand_below(rng, inode_offsets.len())];
+        let (mut offset, layout) = inode_offsets[rand_below(rng, inode_offsets.len())];
+        let inode_size = match layout {
+            InodeLayout::Compact => std::mem::size_of::<ErofsInodeCompact>(),
+            InodeLayout::Extended => std::mem::size_of::<ErofsInodeExtended>(),
+        };
+
+        // Clamp invalid offsets (e.g., stale raw hints) into image range
+        if offset + inode_size > data.len() {
+            if data.len() < inode_size {
+                trace!("Image too small for selected inode layout");
+                return Ok(MutationResult::Skipped);
+            }
+            offset = data.len() - inode_size;
+        }
         trace!("Mutating inode at offset {:#x}", offset);
 
         let result = self.mutate_inode_at(data, offset, layout, rng);

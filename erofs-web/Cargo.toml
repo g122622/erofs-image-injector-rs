@@ -1,0 +1,43 @@
+[package]
+name = "erofs-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Web console for EROFS Image Fuzzer"
+build = "build.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+futures = "0.3"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+nix = { version = "0.29", features = ["signal"] }
+
+# Static file embedding
+rust-embed = "8"
+mime_guess = "2"
+
+# Internal crates - only use erofs-input, not erofs-fuzzer to avoid circular dependency
+erofs-input = { path = "../erofs-input" }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }

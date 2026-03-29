@@ -27,3 +27,7 @@ Thumbs.db
 *.temp
 
 /kernel_build/
+
+node_modules/
+dist/
+static/

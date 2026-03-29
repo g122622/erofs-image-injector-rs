@@ -2,8 +2,6 @@
 //!
 //! A LibAFL-based fuzzer for EROFS filesystem images.
 
-use std::path::PathBuf;
-
 use clap::Parser;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
@@ -24,12 +22,25 @@ fn main() {
         _ => Level::INFO,
     };
 
-    let subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(log_level)
         .with_target(false)
         .with_thread_ids(false)
         .pretty()
         .init();
+
+    // Handle web mode
+    if args.web {
+        tracing::info!("Starting EROFS Web Console on port {}", args.web_port);
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            if let Err(e) = erofs_web::run(args.web_port).await {
+                tracing::error!("Web server error: {}", e);
+                std::process::exit(1);
+            }
+        });
+        return;
+    }
 
     tracing::info!("EROFS Image Fuzzer starting...");
     tracing::info!("Seeds directory: {:?}", args.seeds);

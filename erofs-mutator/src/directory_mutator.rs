@@ -233,10 +233,10 @@ where
             .injection_points()
             .iter()
             .filter_map(|p| {
-                if let erofs_input::InjectionPoint::Dirent { offset, .. } = p {
-                    Some(*offset)
-                } else {
-                    None
+                match p {
+                    erofs_input::InjectionPoint::Dirent { offset, .. } => Some(*offset),
+                    erofs_input::InjectionPoint::Raw { offset, .. } => Some(*offset),
+                    _ => None,
                 }
             })
             .collect();

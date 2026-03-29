@@ -82,9 +82,17 @@ impl FilesystemHarness {
         }
 
         trace!("Reading directory: {:?}", dir);
+        let dir_path = dir.to_string_lossy().to_string();
 
         match fs::read_dir(dir) {
             Ok(entries) => {
+                self.results.push(OperationResult {
+                    op_type: "readdir".to_string(),
+                    path: dir_path,
+                    success: true,
+                    error: None,
+                });
+
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let path_str = path.to_string_lossy().to_string();
@@ -129,7 +137,7 @@ impl FilesystemHarness {
             Err(e) => {
                 self.results.push(OperationResult {
                     op_type: "readdir".to_string(),
-                    path: dir.to_string_lossy().to_string(),
+                    path: dir_path,
                     success: false,
                     error: Some(e.to_string()),
                 });

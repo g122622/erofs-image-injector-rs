@@ -58,12 +58,23 @@ erofs-image-injector-rs/
    sudo apt install erofs-utils
    ```
 
+4. **Node.js + npm** (for Web UI build during `cargo build --release`):
+  ```bash
+  sudo apt install -y nodejs npm
+  ```
+
 ## Building
 
 ```bash
 cd erofs-image-injector-rs
 cargo build --release
 ```
+
+`cargo build --release` now builds both:
+- Rust backend binaries/libraries
+- Vue frontend (`web-ui`) and embeds static assets into the web server crate
+
+`cargo build --features web --release` is no longer needed.
 
 ## Usage
 

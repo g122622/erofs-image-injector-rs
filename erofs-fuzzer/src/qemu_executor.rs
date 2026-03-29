@@ -114,7 +114,7 @@ impl QemuKernelExecutor {
 
     /// Check if kernel and initramfs exist
     pub fn check_requirements(&self) -> Result<(), Error> {
-        if !self.qemu_path.exists() {
+        if !Self::is_executable_available(&self.qemu_path) {
             return Err(Error::illegal_state(format!(
                 "QEMU not found at {:?}",
                 self.qemu_path
@@ -133,6 +133,23 @@ impl QemuKernelExecutor {
             )));
         }
         Ok(())
+    }
+
+    fn is_executable_available(path: &Path) -> bool {
+        if path.is_absolute() || path.to_string_lossy().contains('/') {
+            return path.exists();
+        }
+
+        if path.exists() {
+            return true;
+        }
+
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .any(|dir| dir.join(path).exists())
+            })
+            .unwrap_or(false)
     }
 
     /// Execute a test with the given EROFS image

@@ -13,8 +13,8 @@ use clap::Parser;
 #[command(version = "0.1.0")]
 #[command(about = "LibAFL-based fuzzer for EROFS filesystem images")]
 pub struct CliArgs {
-    /// Directory containing seed EROFS images
-    #[arg(short, long, value_name = "DIR")]
+    /// Directory containing seed EROFS images (not required for --web mode)
+    #[arg(short, long, value_name = "DIR", default_value = "./seeds")]
     pub seeds: PathBuf,
 
     /// Directory to store crash outputs
@@ -120,6 +120,24 @@ pub struct CliArgs {
     /// Memory for QEMU in MB (for QEMU executor)
     #[arg(long, default_value = "512")]
     pub qemu_memory: usize,
+
+    // ===== Web Console Arguments =====
+
+    /// Start web console instead of running fuzzer directly
+    #[arg(long)]
+    pub web: bool,
+
+    /// Port for web console (only used with --web)
+    #[arg(long, default_value = "8080")]
+    pub web_port: u16,
+
+    /// Database path for web console (default: in-memory)
+    #[arg(long, value_name = "PATH")]
+    pub web_db: Option<PathBuf>,
+
+    /// Maximum concurrent tasks in web console
+    #[arg(long, default_value = "4")]
+    pub web_max_tasks: usize,
 }
 
 /// Executor type argument

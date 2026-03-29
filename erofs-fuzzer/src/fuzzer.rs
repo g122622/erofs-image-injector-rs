@@ -139,7 +139,7 @@ fn validate_config(config: &FuzzerConfig) -> FuzzerResult<()> {
     // Check executor-specific requirements
     match config.executor_type {
         ExecutorType::Erofsfuse => {
-            if !config.erofsfuse_path.exists() {
+            if !is_executable_available(&config.erofsfuse_path) {
                 return Err(FuzzerError::Config(format!(
                     "erofsfuse not found at {:?}",
                     config.erofsfuse_path
@@ -159,19 +159,33 @@ fn validate_config(config: &FuzzerConfig) -> FuzzerResult<()> {
                     config.initramfs_path
                 )));
             }
-            // Check QEMU is in PATH or specified path exists
-            if config.qemu_path.to_str() != Some("qemu-system-x86_64") {
-                if !config.qemu_path.exists() {
-                    return Err(FuzzerError::Config(format!(
-                        "QEMU not found at {:?}",
-                        config.qemu_path
-                    )));
-                }
+            if !is_executable_available(&config.qemu_path) {
+                return Err(FuzzerError::Config(format!(
+                    "QEMU not found at {:?}",
+                    config.qemu_path
+                )));
             }
         }
     }
 
     Ok(())
+}
+
+fn is_executable_available(path: &std::path::Path) -> bool {
+    if path.is_absolute() || path.to_string_lossy().contains('/') {
+        return path.exists();
+    }
+
+    if path.exists() {
+        return true;
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .any(|dir| dir.join(path).exists())
+        })
+        .unwrap_or(false)
 }
 
 /// Simple fuzzer state that holds seeds and random generator

@@ -225,12 +225,13 @@ impl KernelMonitor {
 
         for line in lines.iter().skip(start_idx) {
             let trimmed = line.trim();
+            let trimmed_lower = trimmed.to_lowercase();
 
             // Stack trace indicators
-            if trimmed.starts_with("Call Trace:")
-                || trimmed.starts_with("Stack:")
-                || trimmed.starts_with("Backtrace:")
-                || trimmed.starts_with("Stack trace:")
+            if trimmed.contains("Call Trace:")
+                || trimmed.contains("Stack:")
+                || trimmed.contains("Backtrace:")
+                || trimmed_lower.contains("stack trace:")
             {
                 in_trace = true;
                 trace.push_str(trimmed);
@@ -240,20 +241,25 @@ impl KernelMonitor {
 
             // Stack trace lines typically start with addresses or function names
             if in_trace {
-                // Check if this looks like a stack trace line
-                if trimmed.starts_with(' ')
+                // Common line forms:
+                // [  1.234]  show_stack+0x50/0x70
+                // ? function+0x10/0x20
+                // RIP: 0010:function+0x12/0x34
+                let looks_like_trace = trimmed.starts_with(' ')
                     || trimmed.starts_with('\t')
                     || trimmed.starts_with("0x")
                     || trimmed.starts_with('?')
                     || trimmed.contains("+0x")
                     || trimmed.contains("+0X")
-                {
+                    || (trimmed.starts_with('[') && (trimmed.contains("+0x") || trimmed.contains("RIP:")));
+
+                if looks_like_trace {
                     trace.push_str(trimmed);
                     trace.push('\n');
                 } else if trimmed.is_empty() {
                     // Empty line might end the trace
                     break;
-                } else if !trimmed.starts_with('[') && !trimmed.contains(':') {
+                } else if !trimmed.contains("+") && !trimmed.contains(":") {
                     // Probably not part of the trace anymore
                     break;
                 }

@@ -26,6 +26,8 @@ erofs-format = { workspace = true }
 erofs-mutator = { workspace = true }
 erofs-generator = { workspace = true }
 erofs-input = { workspace = true }
+erofs-web = { path = "../erofs-web" }
+tokio = { version = "1", features = ["full"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }

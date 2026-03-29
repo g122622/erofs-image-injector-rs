@@ -1,4 +1,4 @@
-# EROFS 图像模糊测试工具使用指南
+# EROFS 镜像模糊测试工具使用指南
 
 > 本指南面向 EROFS/Linux 内核开发者，帮助您快速上手模糊测试工具。
 >
@@ -15,6 +15,7 @@
 7. [精准注入模式](#精准注入模式)
 8. [输出结果解读](#输出结果解读)
 9. [常见问题](#常见问题)
+10. [Web UI 启动与访问](#web-ui-启动与访问)
 
 ---
 
@@ -28,7 +29,7 @@
 # 1. 编译项目
 cargo build --release
 
-# 2. 准备种子（有效的 EROFS 图像）
+# 2. 准备种子（有效的 EROFS 镜像）
 mkdir -p seeds
 echo "test" > /tmp/test.txt
 mkfs.erofs -E noinline_data seeds/test.erofs /tmp/test.txt
@@ -60,6 +61,28 @@ sudo apt install erofs-utils
     --qemu-path /usr/bin/qemu-system-x86_64 \
     --iterations 10 \
     --timeout 120
+```
+
+> 说明：`cargo build --release` 现在会同时编译 Rust 后端和 `web-ui` 前端，
+> `cargo build --features web --release` 已废弃，不再需要。
+
+### 方式三：启动 Web UI（任务管理控制台）
+
+```bash
+# 1) 构建（会自动构建并内嵌前端）
+cargo build --release
+
+# 2) 启动 Web 控制台（默认 8080）
+./target/release/erofs-fuzzer --web --web-port 8080
+
+# 3) 浏览器访问
+# http://127.0.0.1:8080
+```
+
+常用接口自检：
+
+```bash
+curl http://127.0.0.1:8080/api/health
 ```
 
 ---
@@ -157,6 +180,9 @@ source $HOME/.cargo/env
 # 基本编译工具
 sudo apt install build-essential
 
+# 前端构建工具（cargo build --release 会自动调用）
+sudo apt install nodejs npm
+
 # EROFS 工具（创建种子）
 sudo apt install erofs-utils
 ```
@@ -205,6 +231,8 @@ cargo build --release
     --iterations 1000 \
     --timeout 30
 ```
+
+`cargo build --release` 会自动完成前后端联合构建。
 
 ### 使用 ASan 版本检测更多问题
 
@@ -426,6 +454,39 @@ cat crashes/crash-xxx-kernel-panic.log
 ---
 
 ## 常见问题
+
+## Web UI 启动与访问
+
+### 最简流程
+
+```bash
+cargo build --release
+./target/release/erofs-fuzzer --web --web-port 8090
+```
+
+访问地址：
+
+- `http://127.0.0.1:8080`
+- `http://<你的机器IP>:8080`
+
+### 常用参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--web` | false | 启动 Web 控制台模式 |
+| `--web-port` | `8080` | Web 服务端口 |
+
+### 启动后快速验证
+
+```bash
+curl http://127.0.0.1:8080/api/health
+```
+
+预期返回：
+
+```json
+{"status":"ok","version":"0.1.0"}
+```
 
 ### Q1: erofsfuse 找不到
 

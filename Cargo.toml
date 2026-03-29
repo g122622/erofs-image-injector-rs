@@ -5,6 +5,7 @@ members = [
     "erofs-mutator",
     "erofs-generator",
     "erofs-input",
+    "erofs-web",
 ]
 resolver = "2"
 

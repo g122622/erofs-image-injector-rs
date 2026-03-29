@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: #0a0a0f;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+/* 滚动条样式 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #12121a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e1e2e;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2e2e3e;
+}
+
+/* 表格样式 */
+.table-terminal {
+  @apply w-full border-collapse;
+}
+
+.table-terminal th {
+  @apply bg-terminal-surface border-b border-terminal-border px-4 py-2 text-left text-terminal-muted text-sm;
+}
+
+.table-terminal td {
+  @apply border-b border-terminal-border px-4 py-2 text-sm;
+}
+
+.table-terminal tr:hover td {
+  @apply bg-terminal-surface/50;
+}
+
+/* 按钮样式 */
+.btn {
+  @apply px-4 py-2 rounded font-medium transition-colors duration-200;
+}
+
+.btn-primary {
+  @apply bg-terminal-accent text-terminal-bg hover:bg-terminal-accent/80;
+}
+
+.btn-secondary {
+  @apply bg-terminal-surface border border-terminal-border text-terminal-text hover:bg-terminal-border;
+}
+
+.btn-danger {
+  @apply bg-terminal-error/20 text-terminal-error border border-terminal-error/50 hover:bg-terminal-error/30;
+}
+
+/* 卡片样式 */
+.card {
+  @apply bg-terminal-surface border border-terminal-border rounded-lg;
+}
+
+/* 状态徽章 */
+.badge {
+  @apply px-2 py-1 rounded text-xs font-medium;
+}
+
+.badge-pending {
+  @apply bg-terminal-muted/20 text-terminal-muted;
+}
+
+.badge-running {
+  @apply bg-terminal-accent/20 text-terminal-accent;
+}
+
+.badge-paused {
+  @apply bg-terminal-warning/20 text-terminal-warning;
+}
+
+.badge-completed {
+  @apply bg-terminal-success/20 text-terminal-success;
+}
+
+.badge-failed {
+  @apply bg-terminal-error/20 text-terminal-error;
+}
