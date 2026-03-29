@@ -22,4 +22,10 @@ export default defineConfig({
       },
     },
   },
+  optimizeDeps: {
+    include: ['monaco-editor'],
+  },
+  worker: {
+    format: 'es',
+  },
 })

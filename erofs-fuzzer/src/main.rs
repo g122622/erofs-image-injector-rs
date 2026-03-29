@@ -34,7 +34,26 @@ fn main() {
         tracing::info!("Starting EROFS Web Console on port {}", args.web_port);
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
-            if let Err(e) = erofs_web::run(args.web_port).await {
+            // Use persistent database if --web-db is specified, otherwise use default path
+            let db_path = args.web_db.clone().unwrap_or_else(|| {
+                let config_dir = std::env::var("XDG_CONFIG_HOME")
+                    .map(|p| std::path::PathBuf::from(p))
+                    .unwrap_or_else(|_| {
+                        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                            .join(".config")
+                    });
+                let db_dir = config_dir.join("erofs-fuzzer");
+                std::fs::create_dir_all(&db_dir).ok();
+                db_dir.join("erofs-web.db")
+            });
+
+            let config = erofs_web::ServerConfig {
+                addr: std::net::SocketAddr::from(([0, 0, 0, 0], args.web_port)),
+                db_path: Some(db_path),
+                max_concurrent_tasks: args.web_max_tasks,
+            };
+
+            if let Err(e) = erofs_web::run_server(config).await {
                 tracing::error!("Web server error: {}", e);
                 std::process::exit(1);
             }

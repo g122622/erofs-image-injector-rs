@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::{params, Connection, Result as SqliteResult};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -56,6 +57,7 @@ impl Database {
     fn migrate_schema(conn: &Connection) -> SqliteResult<()> {
         Self::add_column_if_missing(conn, "tasks", "qemu_path", "TEXT")?;
         Self::add_column_if_missing(conn, "tasks", "erofsfuse_path", "TEXT")?;
+        Self::add_column_if_missing(conn, "tasks", "strategy_id", "INTEGER")?;
         Ok(())
     }
 
@@ -94,10 +96,10 @@ impl Database {
                 name, status, executor_type, seeds_dir, output_dir,
                 timeout_seconds, max_iterations, workers,
                 qemu_memory, kernel_path, initramfs_path,
-                qemu_path, erofsfuse_path,
+                qemu_path, erofsfuse_path, strategy_id,
                 current_iteration, total_crashes, exec_per_sec,
                 created_at
-            ) VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, 0, 0.0, ?13)
+            ) VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 0, 0.0, ?14)
             "#,
             params![
                 config.name,
@@ -112,6 +114,7 @@ impl Database {
                 config.initramfs_path,
                 config.qemu_path,
                 config.erofsfuse_path,
+                config.strategy_id,
                 now,
             ],
         )?;
@@ -128,9 +131,9 @@ impl Database {
             SELECT id, name, status, executor_type, seeds_dir, output_dir,
                    timeout_seconds, max_iterations, workers,
                    qemu_memory, kernel_path, initramfs_path,
-                     qemu_path, erofsfuse_path,
-                     current_iteration, total_crashes, exec_per_sec,
-                     created_at, started_at, finished_at, error_message
+                   qemu_path, erofsfuse_path, strategy_id,
+                   current_iteration, total_crashes, exec_per_sec,
+                   created_at, started_at, finished_at, error_message
             FROM tasks WHERE id = ?1
             "#,
         )?;
@@ -151,18 +154,19 @@ impl Database {
                 initramfs_path: row.get(11)?,
                 qemu_path: row.get(12)?,
                 erofsfuse_path: row.get(13)?,
-                current_iteration: row.get::<_, i64>(14)? as u64,
-                total_crashes: row.get::<_, i64>(15)? as u64,
-                exec_per_sec: row.get(16)?,
-                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(17)?, 0)
+                strategy_id: row.get(14)?,
+                current_iteration: row.get::<_, i64>(15)? as u64,
+                total_crashes: row.get::<_, i64>(16)? as u64,
+                exec_per_sec: row.get(17)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(18)?, 0)
                     .unwrap_or_else(chrono::Utc::now),
-                started_at: row.get::<_, Option<i64>>(18)?.and_then(|t| {
+                started_at: row.get::<_, Option<i64>>(19)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                finished_at: row.get::<_, Option<i64>>(19)?.and_then(|t| {
+                finished_at: row.get::<_, Option<i64>>(20)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                error_message: row.get(20)?,
+                error_message: row.get(21)?,
             })
         });
 
@@ -182,9 +186,9 @@ impl Database {
             SELECT id, name, status, executor_type, seeds_dir, output_dir,
                    timeout_seconds, max_iterations, workers,
                    qemu_memory, kernel_path, initramfs_path,
-                     qemu_path, erofsfuse_path,
-                     current_iteration, total_crashes, exec_per_sec,
-                     created_at, started_at, finished_at, error_message
+                   qemu_path, erofsfuse_path, strategy_id,
+                   current_iteration, total_crashes, exec_per_sec,
+                   created_at, started_at, finished_at, error_message
             FROM tasks ORDER BY created_at DESC
             "#,
         )?;
@@ -205,18 +209,19 @@ impl Database {
                 initramfs_path: row.get(11)?,
                 qemu_path: row.get(12)?,
                 erofsfuse_path: row.get(13)?,
-                current_iteration: row.get::<_, i64>(14)? as u64,
-                total_crashes: row.get::<_, i64>(15)? as u64,
-                exec_per_sec: row.get(16)?,
-                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(17)?, 0)
+                strategy_id: row.get(14)?,
+                current_iteration: row.get::<_, i64>(15)? as u64,
+                total_crashes: row.get::<_, i64>(16)? as u64,
+                exec_per_sec: row.get(17)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(18)?, 0)
                     .unwrap_or_else(chrono::Utc::now),
-                started_at: row.get::<_, Option<i64>>(18)?.and_then(|t| {
+                started_at: row.get::<_, Option<i64>>(19)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                finished_at: row.get::<_, Option<i64>>(19)?.and_then(|t| {
+                finished_at: row.get::<_, Option<i64>>(20)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                error_message: row.get(20)?,
+                error_message: row.get(21)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?;
 
@@ -304,6 +309,7 @@ impl Database {
         image_path: &str,
         log_path: Option<&str>,
     ) -> SqliteResult<i64> {
+        info!("[DB] create_crash: task_id={}, iteration={}, type={:?}, path={}", task_id, iteration, crash_type, image_path);
         let conn = self.inner.lock().await;
         let now = chrono::Utc::now().timestamp();
 
@@ -323,7 +329,9 @@ impl Database {
             ],
         )?;
 
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        info!("[DB] create_crash: inserted crash id={}", id);
+        Ok(id)
     }
 
     /// Get a crash by ID
@@ -387,6 +395,7 @@ impl Database {
             sql.push_str(&format!(" OFFSET {}", offset));
         }
 
+        info!("[DB] list_crashes SQL: {}", sql);
         let params: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
@@ -404,6 +413,7 @@ impl Database {
             })
         })?.collect::<Result<Vec<_>, _>>()?;
 
+        info!("[DB] list_crashes returning {} crashes", crashes.len());
         Ok(crashes)
     }
 
@@ -429,6 +439,110 @@ impl Database {
             total_iterations: total_iterations as u64,
         })
     }
+
+    // ========== Mutator Statistics operations ==========
+
+    /// Update or create mutator statistics for a task
+    pub async fn update_mutator_stats(
+        &self,
+        task_id: i64,
+        mutator: &str,
+        executions: u64,
+        crashes: u64,
+        current_weight: u32,
+        original_weight: u32,
+    ) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        let now = chrono::Utc::now().timestamp();
+
+        conn.execute(
+            r#"
+            INSERT INTO mutator_stats (task_id, mutator, executions, crashes, current_weight, original_weight, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(task_id, mutator) DO UPDATE SET
+                executions = excluded.executions,
+                crashes = excluded.crashes,
+                current_weight = excluded.current_weight,
+                original_weight = excluded.original_weight,
+                updated_at = excluded.updated_at
+            "#,
+            params![task_id, mutator, executions as i64, crashes as i64, current_weight as i64, original_weight as i64, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Increment mutator statistics
+    pub async fn increment_mutator_stats(
+        &self,
+        task_id: i64,
+        mutator: &str,
+        executions_delta: u64,
+        crashes_delta: u64,
+    ) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        let now = chrono::Utc::now().timestamp();
+
+        conn.execute(
+            r#"
+            INSERT INTO mutator_stats (task_id, mutator, executions, crashes, current_weight, original_weight, updated_at)
+            VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)
+            ON CONFLICT(task_id, mutator) DO UPDATE SET
+                executions = executions + ?3,
+                crashes = crashes + ?4,
+                updated_at = excluded.updated_at
+            "#,
+            params![task_id, mutator, executions_delta as i64, crashes_delta as i64, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get mutator statistics for a task
+    pub async fn get_mutator_stats(&self, task_id: i64) -> SqliteResult<Vec<MutatorStatsRecord>> {
+        let conn = self.inner.lock().await;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT mutator, executions, crashes, current_weight, original_weight
+            FROM mutator_stats WHERE task_id = ?1
+            "#,
+        )?;
+
+        let stats = stmt.query_map(params![task_id], |row| {
+            Ok(MutatorStatsRecord {
+                mutator: row.get(0)?,
+                executions: row.get::<_, i64>(1)? as u64,
+                crashes: row.get::<_, i64>(2)? as u64,
+                current_weight: row.get::<_, i64>(3)? as u32,
+                original_weight: row.get::<_, i64>(4)? as u32,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(stats)
+    }
+
+    /// Delete mutator statistics for a task
+    pub async fn delete_mutator_stats(&self, task_id: i64) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        conn.execute("DELETE FROM mutator_stats WHERE task_id = ?1", params![task_id])?;
+        Ok(())
+    }
+}
+
+/// Mutator statistics record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutatorStatsRecord {
+    /// Mutator type name
+    pub mutator: String,
+    /// Total executions
+    pub executions: u64,
+    /// Total crashes
+    pub crashes: u64,
+    /// Current weight (may change with adaptive)
+    pub current_weight: u32,
+    /// Original weight
+    pub original_weight: u32,
 }
 
 #[cfg(test)]

@@ -160,6 +160,9 @@ pub struct TaskConfig {
     pub qemu_path: Option<String>,
     /// Erofsfuse binary path
     pub erofsfuse_path: Option<String>,
+    /// Strategy template ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<i64>,
 }
 
 fn default_workers() -> usize {
@@ -181,6 +184,7 @@ impl Default for TaskConfig {
             initramfs_path: None,
             qemu_path: None,
             erofsfuse_path: None,
+            strategy_id: None,
         }
     }
 }
@@ -216,6 +220,8 @@ pub struct Task {
     pub qemu_path: Option<String>,
     /// Erofsfuse binary path (if applicable)
     pub erofsfuse_path: Option<String>,
+    /// Strategy template ID
+    pub strategy_id: Option<i64>,
     /// Current iteration count
     pub current_iteration: u64,
     /// Total crashes found
@@ -315,6 +321,43 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    /// Strategy statistics update
+    StrategyStats {
+        task_id: i64,
+        stats: StrategyStatsMessage,
+    },
+}
+
+/// Strategy statistics message for WebSocket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyStatsMessage {
+    /// Strategy template ID
+    pub strategy_id: Option<i64>,
+    /// Strategy name
+    pub strategy_name: String,
+    /// Per-mutator statistics
+    pub mutators: Vec<MutatorStatsMessage>,
+    /// Total iterations
+    pub total_iterations: u64,
+    /// Total crashes
+    pub total_crashes: u64,
+    /// Whether adaptive weights are active
+    pub adaptive_active: bool,
+}
+
+/// Mutator statistics message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutatorStatsMessage {
+    /// Mutator type
+    pub mutator: String,
+    /// Total executions
+    pub executions: u64,
+    /// Crashes found
+    pub crashes: u64,
+    /// Current weight percentage
+    pub weight_percent: f64,
+    /// Crash rate
+    pub crash_rate: f64,
 }
 
 /// Task statistics for dashboard

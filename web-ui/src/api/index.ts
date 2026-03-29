@@ -1,4 +1,14 @@
-import type { Task, TaskConfig, Crash, TaskStats, CrashType } from '@/types'
+import type {
+  Task,
+  TaskConfig,
+  Crash,
+  TaskStats,
+  CrashType,
+  StrategyTemplate,
+  CreateStrategyRequest,
+  UpdateStrategyRequest,
+  ExportResponse,
+} from '@/types'
 
 const API_BASE = '/api'
 
@@ -83,6 +93,68 @@ class ApiClient {
   // 健康检查
   async healthCheck(): Promise<{ status: string; version: string }> {
     return this.request('/health')
+  }
+
+  // 策略模板 API
+  async listStrategies(): Promise<StrategyTemplate[]> {
+    return this.request<StrategyTemplate[]>('/strategies')
+  }
+
+  async getStrategy(id: number): Promise<StrategyTemplate> {
+    return this.request<StrategyTemplate>(`/strategies/${id}`)
+  }
+
+  async createStrategy(request: CreateStrategyRequest): Promise<StrategyTemplate> {
+    return this.request<StrategyTemplate>('/strategies', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    })
+  }
+
+  async updateStrategy(id: number, request: UpdateStrategyRequest): Promise<StrategyTemplate> {
+    return this.request<StrategyTemplate>(`/strategies/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    })
+  }
+
+  async deleteStrategy(id: number): Promise<void> {
+    await this.request(`/strategies/${id}`, { method: 'DELETE' })
+  }
+
+  async duplicateStrategy(id: number, name?: string): Promise<StrategyTemplate> {
+    return this.request<StrategyTemplate>(`/strategies/${id}/duplicate`, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    })
+  }
+
+  async exportStrategy(id: number): Promise<ExportResponse> {
+    return this.request<ExportResponse>(`/strategies/${id}/export`)
+  }
+
+  async importStrategy(content: string): Promise<StrategyTemplate> {
+    return this.request<StrategyTemplate>('/strategies/import', {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    })
+  }
+
+  async importStrategyFile(file: File): Promise<StrategyTemplate> {
+    const formData = new FormData()
+    formData.append('file', file)
+
+    const response = await fetch(`${API_BASE}/strategies/import-file`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+      throw new Error(error.error || `HTTP ${response.status}`)
+    }
+
+    return response.json()
   }
 }
 

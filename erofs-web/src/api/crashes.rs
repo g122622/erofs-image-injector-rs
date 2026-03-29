@@ -8,7 +8,7 @@ use axum::{
     http::{StatusCode, header},
     Json,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::api::{ApiState, ErrorResponse};
 use crate::types::*;
@@ -18,12 +18,18 @@ pub async fn list_crashes(
     State(state): State<ApiState>,
     Query(filter): Query<CrashFilter>,
 ) -> Result<Json<Vec<Crash>>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Listing crashes with filter: {:?}", filter);
+    info!("[list_crashes] Listing crashes with filter: {:?}", filter);
 
     let crashes = state.db.list_crashes(&filter).await
         .map_err(|e| {
+            info!("[list_crashes] Error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::from(e.to_string())))
         })?;
+
+    info!("[list_crashes] Returning {} crashes", crashes.len());
+    for crash in &crashes {
+        info!("[list_crashes] Crash #{}: task_id={}, type={:?}, path={}", crash.id, crash.task_id, crash.crash_type, crash.image_path);
+    }
 
     Ok(Json(crashes))
 }

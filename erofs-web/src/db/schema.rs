@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     qemu_path TEXT,
     erofsfuse_path TEXT,
 
+    -- Strategy configuration
+    strategy_id INTEGER,
+
     -- Statistics
     current_iteration INTEGER DEFAULT 0,
     total_crashes INTEGER DEFAULT 0,
@@ -37,6 +40,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- Index for task status queries
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_strategy_id ON tasks(strategy_id);
 
 -- Crashes table
 CREATE TABLE IF NOT EXISTS crashes (
@@ -56,4 +60,21 @@ CREATE TABLE IF NOT EXISTS crashes (
 CREATE INDEX IF NOT EXISTS idx_crashes_task_id ON crashes(task_id);
 CREATE INDEX IF NOT EXISTS idx_crashes_created_at ON crashes(created_at);
 CREATE INDEX IF NOT EXISTS idx_crashes_type ON crashes(crash_type);
+
+-- Mutator statistics table
+CREATE TABLE IF NOT EXISTS mutator_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    mutator TEXT NOT NULL,
+    executions INTEGER DEFAULT 0,
+    crashes INTEGER DEFAULT 0,
+    current_weight INTEGER DEFAULT 0,
+    original_weight INTEGER DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    UNIQUE(task_id, mutator)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mutator_stats_task_id ON mutator_stats(task_id);
 "#;

@@ -2,11 +2,14 @@
 import { ref, onMounted } from 'vue'
 import { api } from '@/api'
 import type { Crash, CrashType } from '@/types'
+import ReproScriptModal from '@/components/ReproScriptModal.vue'
 
 const crashes = ref<Crash[]>([])
 const loading = ref(true)
 const filterTaskId = ref<number | null>(null)
 const filterType = ref<CrashType | null>(null)
+const showReproModal = ref(false)
+const selectedCrashId = ref<number | null>(null)
 
 onMounted(async () => {
   await fetchCrashes()
@@ -39,6 +42,11 @@ function getCrashTypeClass(type: CrashType): string {
     KernelOops: 'bg-terminal-warning/20 text-terminal-warning',
   }
   return classes[type] || ''
+}
+
+function showRepro(crashId: number) {
+  selectedCrashId.value = crashId
+  showReproModal.value = true
 }
 </script>
 
@@ -124,16 +132,23 @@ function getCrashTypeClass(type: CrashType): string {
               >
                 Download
               </a>
-              <a
-                :href="`/api/crashes/${crash.id}/repro`"
+              <button
+                @click="showRepro(crash.id)"
                 class="btn btn-secondary text-xs px-2 py-1"
               >
                 Repro
-              </a>
+              </button>
             </td>
           </tr>
         </tbody>
       </table>
     </div>
+
+    <!-- Repro Script Modal -->
+    <ReproScriptModal
+      v-if="showReproModal && selectedCrashId"
+      :crash-id="selectedCrashId"
+      @close="showReproModal = false"
+    />
   </div>
 </template>

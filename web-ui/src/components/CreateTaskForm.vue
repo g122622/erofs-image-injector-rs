@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { useTaskStore } from '@/stores/task'
-import type { TaskConfig } from '@/types'
+import { api } from '@/api'
+import type { TaskConfig, StrategyTemplate } from '@/types'
 
 const taskStore = useTaskStore()
+
+const strategies = ref<StrategyTemplate[]>([])
+const showStrategyGuide = ref(false)
 
 const createDefaultForm = (): TaskConfig => ({
   name: '',
@@ -18,12 +22,28 @@ const createDefaultForm = (): TaskConfig => ({
   qemu_path: '/usr/bin/qemu-system-x86_64',
   qemu_memory: 1024,
   erofsfuse_path: 'erofsfuse',
+  strategy_id: undefined,
 })
 
 const form = ref<TaskConfig>(createDefaultForm())
 
 const submitting = ref(false)
 const error = ref<string | null>(null)
+
+const selectedStrategy = computed(() => {
+  if (!form.value.strategy_id) return null
+  return strategies.value.find(s => s.id === form.value.strategy_id)
+})
+
+onMounted(async () => {
+  try {
+    strategies.value = await api.listStrategies()
+    // Show strategy guide if no strategy selected and strategies are loaded
+    showStrategyGuide.value = strategies.value.length > 0 && !form.value.strategy_id
+  } catch (e) {
+    console.error('Failed to load strategies:', e)
+  }
+})
 
 async function handleSubmit() {
   submitting.value = true
@@ -41,12 +61,73 @@ async function handleSubmit() {
     submitting.value = false
   }
 }
+
+function selectStrategy(strategy: StrategyTemplate | null) {
+  form.value.strategy_id = strategy?.id
+  showStrategyGuide.value = false
+}
+
+function getEnabledMutatorCount(strategy: StrategyTemplate): number {
+  return Object.values(strategy.mutators).filter(c => c.enabled).length
+}
 </script>
 
 <template>
   <form @submit.prevent="handleSubmit" class="card p-4 space-y-4">
     <div v-if="error" class="bg-terminal-error/20 text-terminal-error px-3 py-2 rounded text-sm">
       {{ error }}
+    </div>
+
+    <!-- Strategy Selection Guide -->
+    <div v-if="showStrategyGuide && strategies.length > 0" class="bg-terminal-surface border border-terminal-border rounded-lg p-4">
+      <h3 class="text-sm font-medium text-terminal-text mb-3">Select a Mutation Strategy</h3>
+      <p class="text-xs text-terminal-muted mb-4">Choose a strategy template for your fuzzing task.</p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <button
+          v-for="strategy in strategies.filter(s => s.is_builtin).slice(0, 4)"
+          :key="strategy.id"
+          type="button"
+          @click="selectStrategy(strategy)"
+          class="p-3 border rounded-lg text-left transition-colors"
+          :class="form.strategy_id === strategy.id
+            ? 'border-terminal-accent bg-terminal-accent/10'
+            : 'border-terminal-border hover:border-terminal-accent/50'"
+        >
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-sm font-medium text-terminal-text">{{ strategy.name }}</span>
+            <span class="text-xs text-terminal-muted">{{ getEnabledMutatorCount(strategy) }} mutators</span>
+          </div>
+          <p class="text-xs text-terminal-muted line-clamp-2">{{ strategy.description }}</p>
+        </button>
+        <button
+          type="button"
+          @click="selectStrategy(null)"
+          class="p-3 border border-dashed border-terminal-border rounded-lg text-left hover:border-terminal-accent/50 transition-colors"
+        >
+          <div class="text-sm text-terminal-muted">No Strategy (Default)</div>
+          <p class="text-xs text-terminal-muted mt-1">Use default mutation settings</p>
+        </button>
+      </div>
+    </div>
+
+    <!-- Selected Strategy Display -->
+    <div v-else class="flex items-center justify-between p-3 bg-terminal-surface border border-terminal-border rounded-lg">
+      <div>
+        <span class="text-xs text-terminal-muted">Strategy:</span>
+        <span class="ml-2 text-sm text-terminal-text">
+          {{ selectedStrategy?.name || 'Default (No strategy)' }}
+        </span>
+        <span v-if="selectedStrategy" class="ml-2 text-xs text-terminal-muted">
+          ({{ getEnabledMutatorCount(selectedStrategy) }} mutators)
+        </span>
+      </div>
+      <button
+        type="button"
+        @click="showStrategyGuide = true"
+        class="text-xs text-terminal-accent hover:text-terminal-accent/80"
+      >
+        Change
+      </button>
     </div>
 
     <div>

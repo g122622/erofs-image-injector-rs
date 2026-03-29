@@ -2,9 +2,10 @@
 
 mod tasks;
 mod crashes;
+mod strategies;
 
 use axum::{
-    routing::{get, post, delete, Router},
+    routing::{get, post, put, delete, Router},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,15 +13,18 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::db::Database;
 use crate::task_manager::TaskManager;
+use crate::strategy::StrategyStorage;
 
 pub use tasks::*;
 pub use crashes::*;
+pub use strategies::*;
 
 /// API state shared by handlers
 #[derive(Debug, Clone)]
 pub struct ApiState {
     pub db: Database,
     pub task_manager: TaskManager,
+    pub strategy_storage: StrategyStorage,
 }
 
 /// Create the API router (without state - state is applied later)
@@ -38,6 +42,13 @@ pub fn create_router() -> Router<ApiState> {
         .route("/api/crashes/:id", get(get_crash))
         .route("/api/crashes/:id/image", get(get_crash_image))
         .route("/api/crashes/:id/repro", get(get_crash_repro))
+        // Strategy endpoints
+        .route("/api/strategies", get(list_strategies).post(create_strategy))
+        .route("/api/strategies/:id", get(get_strategy).put(update_strategy).delete(delete_strategy))
+        .route("/api/strategies/:id/duplicate", post(duplicate_strategy))
+        .route("/api/strategies/:id/export", get(export_strategy))
+        .route("/api/strategies/import", post(import_strategy))
+        .route("/api/strategies/import-file", post(import_strategy_file))
         // Stats endpoint
         .route("/api/stats", get(get_stats))
         // Health check

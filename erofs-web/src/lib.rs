@@ -6,6 +6,8 @@
 
 pub mod api;
 pub mod db;
+pub mod strategy;
+pub mod strategy_types;
 pub mod task_manager;
 pub mod types;
 pub mod ws;
@@ -25,6 +27,7 @@ use tracing::info;
 
 use crate::api::ApiState;
 use crate::db::Database;
+use crate::strategy::StrategyStorage;
 use crate::task_manager::TaskManager;
 
 #[derive(RustEmbed)]
@@ -65,6 +68,10 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
         }
     };
 
+    // Initialize strategy storage
+    let strategy_storage = StrategyStorage::with_default_path()?;
+    strategy_storage.initialize().await?;
+
     // Create task manager
     let task_manager = if config.max_concurrent_tasks != 4 {
         TaskManager::with_concurrency(db.clone(), config.max_concurrent_tasks)
@@ -73,7 +80,11 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     };
 
     // Create API state
-    let state = ApiState { db, task_manager };
+    let state = ApiState {
+        db,
+        task_manager,
+        strategy_storage,
+    };
 
     // Build router with state
     let app = create_app(state);

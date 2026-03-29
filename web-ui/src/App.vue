@@ -1,8 +1,22 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref, provide } from 'vue'
 import { useTaskStore } from '@/stores/task'
 
 const taskStore = useTaskStore()
+
+// Notification state
+const notification = ref<{ message: string; type: 'success' | 'error' } | null>(null)
+let notificationTimer: ReturnType<typeof setTimeout> | null = null
+
+function showNotification(message: string, type: 'success' | 'error') {
+  notification.value = { message, type }
+  if (notificationTimer) {
+    clearTimeout(notificationTimer)
+  }
+  notificationTimer = setTimeout(() => {
+    notification.value = null
+  }, 3000)
+}
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -57,6 +71,9 @@ function handleWebSocketMessage(msg: any) {
   }
 }
 
+// Provide notification function globally
+provide('notify', showNotification)
+
 onMounted(() => {
   taskStore.fetchTasks()
   taskStore.fetchStats()
@@ -67,6 +84,9 @@ onUnmounted(() => {
   ws?.close()
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)
+  }
+  if (notificationTimer) {
+    clearTimeout(notificationTimer)
   }
 })
 </script>
@@ -101,6 +121,13 @@ onUnmounted(() => {
               >
                 Crashes
               </router-link>
+              <router-link
+                to="/strategies"
+                class="text-terminal-muted hover:text-terminal-text transition-colors"
+                active-class="text-terminal-accent"
+              >
+                Strategies
+              </router-link>
             </nav>
           </div>
           <div class="text-sm text-terminal-muted">
@@ -115,5 +142,14 @@ onUnmounted(() => {
     <main class="container mx-auto px-4 py-6">
       <router-view />
     </main>
+
+    <!-- Notification -->
+    <div
+      v-if="notification"
+      class="fixed bottom-4 right-4 z-50 px-4 py-3 rounded-md shadow-lg"
+      :class="notification.type === 'success' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'"
+    >
+      {{ notification.message }}
+    </div>
   </div>
 </template>
