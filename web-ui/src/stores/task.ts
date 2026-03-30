@@ -146,6 +146,27 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
+  // 批量停止任务
+  async function batchStopTasks(ids: number[]) {
+    const result = await api.batchStopTasks(ids)
+    // 更新成功停止的任务状态
+    for (const id of result.success) {
+      const task = tasks.value.find(t => t.id === id)
+      if (task) {
+        task.status = 'cancelled'
+      }
+    }
+    return result
+  }
+
+  // 批量删除任务
+  async function batchDeleteTasks(ids: number[]) {
+    const result = await api.batchDeleteTasks(ids)
+    // 从列表中移除成功删除的任务
+    tasks.value = tasks.value.filter(t => !result.success.includes(t.id))
+    return result
+  }
+
   return {
     tasks,
     stats,
@@ -162,5 +183,7 @@ export const useTaskStore = defineStore('task', () => {
     updateTask,
     updateProgress,
     updateStatus,
+    batchStopTasks,
+    batchDeleteTasks,
   }
 })

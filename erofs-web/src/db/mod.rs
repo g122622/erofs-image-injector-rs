@@ -58,6 +58,8 @@ impl Database {
         Self::add_column_if_missing(conn, "tasks", "qemu_path", "TEXT")?;
         Self::add_column_if_missing(conn, "tasks", "erofsfuse_path", "TEXT")?;
         Self::add_column_if_missing(conn, "tasks", "strategy_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "tasks", "kernel_version", "TEXT")?;
+        Self::add_column_if_missing(conn, "tasks", "erofs_version", "TEXT")?;
         Ok(())
     }
 
@@ -133,6 +135,7 @@ impl Database {
                    qemu_memory, kernel_path, initramfs_path,
                    qemu_path, erofsfuse_path, strategy_id,
                    current_iteration, total_crashes, exec_per_sec,
+                   kernel_version, erofs_version,
                    created_at, started_at, finished_at, error_message
             FROM tasks WHERE id = ?1
             "#,
@@ -158,15 +161,17 @@ impl Database {
                 current_iteration: row.get::<_, i64>(15)? as u64,
                 total_crashes: row.get::<_, i64>(16)? as u64,
                 exec_per_sec: row.get(17)?,
-                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(18)?, 0)
+                kernel_version: row.get(18)?,
+                erofs_version: row.get(19)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(20)?, 0)
                     .unwrap_or_else(chrono::Utc::now),
-                started_at: row.get::<_, Option<i64>>(19)?.and_then(|t| {
+                started_at: row.get::<_, Option<i64>>(21)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                finished_at: row.get::<_, Option<i64>>(20)?.and_then(|t| {
+                finished_at: row.get::<_, Option<i64>>(22)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                error_message: row.get(21)?,
+                error_message: row.get(23)?,
             })
         });
 
@@ -188,6 +193,7 @@ impl Database {
                    qemu_memory, kernel_path, initramfs_path,
                    qemu_path, erofsfuse_path, strategy_id,
                    current_iteration, total_crashes, exec_per_sec,
+                   kernel_version, erofs_version,
                    created_at, started_at, finished_at, error_message
             FROM tasks ORDER BY created_at DESC
             "#,
@@ -213,15 +219,17 @@ impl Database {
                 current_iteration: row.get::<_, i64>(15)? as u64,
                 total_crashes: row.get::<_, i64>(16)? as u64,
                 exec_per_sec: row.get(17)?,
-                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(18)?, 0)
+                kernel_version: row.get(18)?,
+                erofs_version: row.get(19)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(20)?, 0)
                     .unwrap_or_else(chrono::Utc::now),
-                started_at: row.get::<_, Option<i64>>(19)?.and_then(|t| {
+                started_at: row.get::<_, Option<i64>>(21)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                finished_at: row.get::<_, Option<i64>>(20)?.and_then(|t| {
+                finished_at: row.get::<_, Option<i64>>(22)?.and_then(|t| {
                     chrono::DateTime::from_timestamp(t, 0)
                 }),
-                error_message: row.get(21)?,
+                error_message: row.get(23)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?;
 
@@ -272,6 +280,23 @@ impl Database {
         conn.execute(
             "UPDATE tasks SET current_iteration = ?1, total_crashes = ?2, exec_per_sec = ?3 WHERE id = ?4",
             params![iteration as i64, crashes as i64, speed, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Update task version information
+    pub async fn update_task_versions(
+        &self,
+        id: i64,
+        kernel_version: Option<&str>,
+        erofs_version: Option<&str>,
+    ) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+
+        conn.execute(
+            "UPDATE tasks SET kernel_version = ?1, erofs_version = ?2 WHERE id = ?3",
+            params![kernel_version, erofs_version, id],
         )?;
 
         Ok(())

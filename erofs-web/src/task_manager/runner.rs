@@ -18,6 +18,7 @@ use crate::strategy::StrategyStorage;
 use crate::task_manager::ControlMessage;
 use crate::task_manager::TaskEvent;
 use crate::types::*;
+use crate::types::LogLevel;
 
 /// Task runner that executes fuzzing
 pub struct TaskRunner {
@@ -47,6 +48,10 @@ pub struct TaskRunner {
     total_seeds: usize,
     /// Max iterations (parsed from fuzzer output)
     max_iterations: u64,
+    /// Kernel version (parsed from fuzzer output)
+    kernel_version: Option<String>,
+    /// EROFS version (parsed from fuzzer output)
+    erofs_version: Option<String>,
 }
 
 impl TaskRunner {
@@ -72,6 +77,8 @@ impl TaskRunner {
             current_speed: 0.0,
             total_seeds: 0,
             max_iterations: 0,
+            kernel_version: None,
+            erofs_version: None,
         }
     }
 
@@ -103,17 +110,34 @@ impl TaskRunner {
         let mut last_update = Instant::now();
 
         // Spawn a task to read stdout and extract mutator info
-        let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(64);
+        let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(256);
         let stdout = child.stdout.take().expect("Failed to capture stdout");
         let task_id = self.task.id;
+        let event_tx = self.event_tx.clone();
         let stdout_task = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 // Send line to channel for processing
-                if stdout_tx.send(line).await.is_err() {
+                if stdout_tx.send(line.clone()).await.is_err() {
                     break;
                 }
+                // Send log event
+                let level = if line.contains("[ERROR]") || line.contains("[error]") || line.contains("ERROR") {
+                    LogLevel::Error
+                } else if line.contains("[WARN]") || line.contains("[warn]") || line.contains("WARN") {
+                    LogLevel::Warn
+                } else if line.contains("[DEBUG]") || line.contains("[debug]") || line.contains("DEBUG") {
+                    LogLevel::Debug
+                } else {
+                    LogLevel::Info
+                };
+                let _ = event_tx.send(TaskEvent::Log {
+                    task_id,
+                    level,
+                    message: line,
+                    timestamp: chrono::Utc::now().timestamp(),
+                });
             }
             info!("[Task {}] Stdout reader finished", task_id);
         });
@@ -137,7 +161,7 @@ impl TaskRunner {
                     debug!("[Task {}] Progress from fuzzer: iter={}, crashes={}, speed={}",
                            self.task.id, self.current_iteration, self.current_crashes, self.current_speed);
                 }
-                // Parse fuzzer start: [FUZZER] start seeds=N max_iterations=N
+                // Parse fuzzer start: [FUZZER] start seeds=N max_iterations=N kernel_version=... erofs_version=...
                 else if line.starts_with("[FUZZER] start") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     for part in parts {
@@ -145,10 +169,24 @@ impl TaskRunner {
                             self.total_seeds = val.parse().unwrap_or(0);
                         } else if let Some(val) = part.strip_prefix("max_iterations=") {
                             self.max_iterations = val.parse().unwrap_or(0);
+                        } else if let Some(val) = part.strip_prefix("kernel_version=") {
+                            self.kernel_version = Some(val.to_string());
+                        } else if let Some(val) = part.strip_prefix("erofs_version=") {
+                            self.erofs_version = Some(val.to_string());
                         }
                     }
-                    info!("[Task {}] Fuzzer started: seeds={}, max_iterations={}",
-                          self.task.id, self.total_seeds, self.max_iterations);
+                    info!("[Task {}] Fuzzer started: seeds={}, max_iterations={}, kernel={:?}, erofs={:?}",
+                          self.task.id, self.total_seeds, self.max_iterations,
+                          self.kernel_version, self.erofs_version);
+
+                    // Update version info in database
+                    if let Err(e) = self.db.update_task_versions(
+                        self.task.id,
+                        self.kernel_version.as_deref(),
+                        self.erofs_version.as_deref(),
+                    ).await {
+                        warn!("[Task {}] Failed to update version info: {}", self.task.id, e);
+                    }
                 }
                 // Parse mutator: [MUTATOR] xxx
                 else if line.contains("[MUTATOR]") {

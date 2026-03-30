@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     total_crashes INTEGER DEFAULT 0,
     exec_per_sec REAL DEFAULT 0.0,
 
+    -- Version information (detected at runtime)
+    kernel_version TEXT,
+    erofs_version TEXT,
+
     -- Timestamps
     created_at INTEGER NOT NULL,
     started_at INTEGER,

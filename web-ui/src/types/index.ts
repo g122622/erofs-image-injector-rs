@@ -159,6 +159,8 @@ export interface Task {
   total_crashes: number
   exec_per_sec: number
   current_mutator?: string
+  kernel_version?: string
+  erofs_version?: string
   created_at: string
   started_at?: string
   finished_at?: string
@@ -187,6 +189,9 @@ export interface TaskStats {
   total_crashes: number
   total_iterations: number
 }
+
+// 日志级别
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 // WebSocket 消息
 export interface ProgressMessage {
@@ -228,6 +233,14 @@ export interface StrategyStatsMessage {
   stats: StrategyStats
 }
 
+export interface LogMessage {
+  type: 'log'
+  task_id: number
+  level: LogLevel
+  message: string
+  timestamp: number
+}
+
 export type ServerMessage =
   | ProgressMessage
   | StatusMessage
@@ -235,6 +248,7 @@ export type ServerMessage =
   | TaskCreatedMessage
   | ErrorMessage
   | StrategyStatsMessage
+  | LogMessage
 
 // API 响应
 export interface ErrorResponse {

@@ -32,6 +32,8 @@ pub fn create_router() -> Router<ApiState> {
     Router::new()
         // Task endpoints
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/tasks/batch/stop", post(batch_stop_tasks))
+        .route("/api/tasks/batch/delete", post(batch_delete_tasks))
         .route("/api/tasks/:id", get(get_task).delete(delete_task))
         .route("/api/tasks/:id/start", post(start_task))
         .route("/api/tasks/:id/stop", post(stop_task))

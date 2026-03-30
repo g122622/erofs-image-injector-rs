@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::task_manager::TaskEvent;
-use crate::types::{ClientMessage, ServerMessage};
+use crate::types::{ClientMessage, LogLevel, ServerMessage};
 use crate::api::ApiState;
 
 /// WebSocket connection state
@@ -112,6 +112,7 @@ fn should_send_event(state: &ConnectionState, event: &TaskEvent) -> bool {
         TaskEvent::CrashFound { task_id, .. } => *task_id,
         TaskEvent::Finished { task_id, .. } => *task_id,
         TaskEvent::Error { task_id, .. } => *task_id,
+        TaskEvent::Log { task_id, .. } => *task_id,
     };
 
     state.subscribed_tasks.contains(&task_id)
@@ -159,6 +160,14 @@ fn event_to_message(event: &TaskEvent) -> String {
         TaskEvent::Error { task_id, message } => {
             ServerMessage::Error {
                 message: format!("Task {}: {}", task_id, message),
+            }
+        }
+        TaskEvent::Log { task_id, level, message, timestamp } => {
+            ServerMessage::Log {
+                task_id: *task_id,
+                level: *level,
+                message: message.clone(),
+                timestamp: *timestamp,
             }
         }
     };

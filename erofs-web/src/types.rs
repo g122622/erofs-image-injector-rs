@@ -228,6 +228,10 @@ pub struct Task {
     pub total_crashes: u64,
     /// Executions per second
     pub exec_per_sec: f64,
+    /// Kernel version (detected at runtime)
+    pub kernel_version: Option<String>,
+    /// EROFS version (detected at runtime)
+    pub erofs_version: Option<String>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Start timestamp
@@ -328,6 +332,48 @@ pub enum ServerMessage {
         task_id: i64,
         stats: StrategyStatsMessage,
     },
+    /// Real-time log message
+    Log {
+        task_id: i64,
+        level: LogLevel,
+        message: String,
+        timestamp: i64,
+    },
+}
+
+/// Log level for real-time logs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Debug => write!(f, "debug"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Warn => write!(f, "warn"),
+            LogLevel::Error => write!(f, "error"),
+        }
+    }
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "debug" => Ok(Self::Debug),
+            "info" => Ok(Self::Info),
+            "warn" | "warning" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            _ => Err(format!("Invalid log level: {}", s)),
+        }
+    }
 }
 
 /// Strategy statistics message for WebSocket

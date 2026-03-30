@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { api } from '@/api'
 import type { Task, Crash, StrategyTemplate, MutatorStats } from '@/types'
 import { MUTATOR_INFO } from '@/types'
+import LogPanel from '@/components/LogPanel.vue'
 
 const route = useRoute()
 const task = ref<Task | null>(null)
@@ -169,6 +170,21 @@ const totalCrashesFromStats = computed(() => {
         </div>
       </div>
 
+      <!-- Version Info -->
+      <div v-if="task.kernel_version || task.erofs_version" class="card p-4">
+        <h2 class="text-lg font-semibold mb-3">Version Information</h2>
+        <div class="grid grid-cols-2 gap-4 text-sm">
+          <div v-if="task.kernel_version">
+            <span class="text-terminal-muted">Kernel Version:</span>
+            <span class="ml-2 font-mono text-terminal-accent">{{ task.kernel_version }}</span>
+          </div>
+          <div v-if="task.erofs_version">
+            <span class="text-terminal-muted">EROFS Version:</span>
+            <span class="ml-2 font-mono text-terminal-accent">{{ task.erofs_version }}</span>
+          </div>
+        </div>
+      </div>
+
       <!-- Strategy Info -->
       <div v-if="strategy" class="card p-4">
         <div class="flex justify-between items-center mb-4">
@@ -307,6 +323,55 @@ const totalCrashesFromStats = computed(() => {
         </div>
       </div>
 
+      <!-- Crashes -->
+      <div class="card p-4">
+        <h2 class="text-lg font-semibold mb-4">Crashes ({{ crashes.length }})</h2>
+        <div v-if="crashes.length > 0" class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="border-b border-terminal-border">
+                <th class="text-left py-2 text-terminal-muted">ID</th>
+                <th class="text-left py-2 text-terminal-muted">Type</th>
+                <th class="text-left py-2 text-terminal-muted">Iteration</th>
+                <th class="text-left py-2 text-terminal-muted">Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="crash in crashes"
+                :key="crash.id"
+                class="border-b border-terminal-border/50 hover:bg-terminal-border/20"
+              >
+                <td class="py-2 text-terminal-muted">#{{ crash.id }}</td>
+                <td class="py-2">
+                  <span
+                    :class="[
+                      'px-2 py-0.5 text-xs rounded',
+                      crash.crash_type === 'KernelPanic' ? 'bg-red-500/20 text-red-400' :
+                      crash.crash_type === 'KernelOops' ? 'bg-orange-500/20 text-orange-400' :
+                      crash.crash_type === 'ASan' ? 'bg-yellow-500/20 text-yellow-400' :
+                      'bg-red-500/20 text-red-400'
+                    ]"
+                  >
+                    {{ crash.crash_type }}
+                  </span>
+                </td>
+                <td class="py-2 text-left font-mono">{{ crash.iteration.toLocaleString() }}</td>
+                <td class="py-2 text-terminal-muted text-xs">{{ formatDate(crash.created_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="text-center text-terminal-muted py-4">
+          No crashes recorded
+        </div>
+      </div>
+
+      <!-- Real-time Logs -->
+      <div class="card p-4">
+        <LogPanel :task-id="task.id" />
+      </div>
+
       <!-- Timeline -->
       <div class="card p-4">
         <h2 class="text-lg font-semibold mb-4">Timeline</h2>
@@ -326,27 +391,6 @@ const totalCrashesFromStats = computed(() => {
           <div v-if="task.error_message" class="mt-2 p-2 bg-terminal-error/20 text-terminal-error rounded">
             {{ task.error_message }}
           </div>
-        </div>
-      </div>
-
-      <!-- Crashes -->
-      <div class="card p-4">
-        <h2 class="text-lg font-semibold mb-4">Crashes ({{ crashes.length }})</h2>
-        <div v-if="crashes.length > 0" class="space-y-2">
-          <div
-            v-for="crash in crashes"
-            :key="crash.id"
-            class="p-3 bg-terminal-bg rounded border border-terminal-border"
-          >
-            <div class="flex justify-between">
-              <span class="font-medium text-terminal-error">{{ crash.crash_type }}</span>
-              <span class="text-terminal-muted text-sm">Iteration {{ crash.iteration }}</span>
-            </div>
-            <div class="text-xs text-terminal-muted mt-1">{{ formatDate(crash.created_at) }}</div>
-          </div>
-        </div>
-        <div v-else class="text-center text-terminal-muted py-4">
-          No crashes recorded
         </div>
       </div>
     </template>

@@ -34,6 +34,8 @@ pub enum TaskEvent {
     Finished { task_id: i64, status: TaskStatus },
     /// Error occurred
     Error { task_id: i64, message: String },
+    /// Log message
+    Log { task_id: i64, level: LogLevel, message: String, timestamp: i64 },
 }
 
 /// Task manager handle

@@ -421,8 +421,12 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
         info!("  Mutator '{}': weight {} ({:.1}%)", name, weight, (*weight as f64 / total_weight as f64) * 100.0);
     }
 
-    // Output startup message to stdout for parent process to parse
-    println!("[FUZZER] start seeds={} max_iterations={}", state.seeds.len(), config.max_iterations);
+    // Detect and output version information
+    let (kernel_version, erofs_version) = detect_versions(config);
+    println!("[FUZZER] start seeds={} max_iterations={} kernel_version={} erofs_version={}",
+             state.seeds.len(), config.max_iterations,
+             kernel_version.as_deref().unwrap_or("unknown"),
+             erofs_version.as_deref().unwrap_or("unknown"));
     let _ = std::io::stdout().flush();
 
     // Track timing for speed calculation
@@ -697,6 +701,263 @@ fn select_weighted_mutator(
     // Fallback to bitflip
     let _ = bitflip_mutator.mutate(state, input);
     Some("bitflip")
+}
+
+/// Detect kernel version and EROFS version
+fn detect_versions(config: &FuzzerConfig) -> (Option<String>, Option<String>) {
+    let kernel_version = detect_kernel_version(config);
+    let erofs_version = detect_erofs_version(config);
+    (kernel_version, erofs_version)
+}
+
+/// Detect kernel version from kernel file or running system
+fn detect_kernel_version(config: &FuzzerConfig) -> Option<String> {
+    match config.executor_type {
+        ExecutorType::QemuKernel => {
+            let kernel_path = &config.kernel_path;
+
+            // Try to read kernel version string from the file
+            if let Ok(data) = std::fs::read(kernel_path) {
+                // Search for "Linux version X.Y.Z" string
+                if let Some(version) = find_linux_version(&data) {
+                    return Some(version);
+                }
+
+                // Alternative: look for version string like "X.Y.Z (user@host)"
+                // This is common in kernel builds
+                if let Some(version) = find_kernel_version_string(&data) {
+                    return Some(version);
+                }
+            }
+
+            // Try to extract version from kernel file name
+            let file_name = kernel_path.file_name()?.to_str()?;
+
+            // Common patterns: bzImage-5.15.0, vmlinuz-5.15.0
+            if file_name.starts_with("bzImage-") || file_name.starts_with("vmlinuz-") {
+                let version = file_name
+                    .strip_prefix("bzImage-")
+                    .or_else(|| file_name.strip_prefix("vmlinuz-"));
+                return version.map(|s| s.to_string());
+            }
+
+            // Check if parent directory has version info (e.g., linux-6.8/bzImage)
+            if let Some(parent) = kernel_path.parent() {
+                if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                    // Pattern: linux-6.8, kernel-5.15.0
+                    if let Some(version) = parent_name.strip_prefix("linux-")
+                        .or_else(|| parent_name.strip_prefix("kernel-"))
+                    {
+                        // Check if it looks like a version
+                        if version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                            return Some(version.to_string());
+                        }
+                    }
+                }
+            }
+
+            None
+        }
+        ExecutorType::Erofsfuse => {
+            // For erofsfuse, get the running kernel version
+            std::process::Command::new("uname")
+                .arg("-r")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        }
+    }
+}
+
+/// Find "Linux version X.Y.Z" string in kernel binary data
+fn find_linux_version(data: &[u8]) -> Option<String> {
+    // Look for "Linux version " followed by version number
+    let pattern = b"Linux version ";
+    let start = data.windows(pattern.len())
+        .position(|w| w == pattern)?;
+
+    let rest = &data[start + pattern.len()..];
+
+    // Version is typically like "5.15.0"
+    let version_end = rest.iter()
+        .position(|&b| !b.is_ascii_digit() && b != b'.')
+        .unwrap_or(rest.len().min(20));
+
+    if version_end > 0 {
+        String::from_utf8(rest[..version_end].to_vec()).ok()
+    } else {
+        None
+    }
+}
+
+/// Find kernel version string in format "X.Y.Z (user@host)" common in kernel builds
+fn find_kernel_version_string(data: &[u8]) -> Option<String> {
+    // The kernel version string is embedded as "X.Y.Z (user@host)"
+    // We search for this pattern directly
+
+    for i in 0..data.len().saturating_sub(10) {
+        // Check if this position looks like version start (digit)
+        if data[i].is_ascii_digit() {
+            // Try to parse version: X.Y.Z
+            let mut j = i;
+            let mut dot_count = 0;
+            let mut has_digit_after_dot = false;
+
+            while j < data.len() && j < i + 20 {
+                let c = data[j];
+                if c.is_ascii_digit() {
+                    if dot_count > 0 {
+                        has_digit_after_dot = true;
+                    }
+                    j += 1;
+                } else if c == b'.' {
+                    dot_count += 1;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Check if we have a valid version (at least X.Y format)
+            if dot_count >= 1 && has_digit_after_dot && j < data.len() {
+                // Check if followed by space and '(' (kernel version string pattern)
+                if data[j] == b' ' && j + 1 < data.len() && data[j + 1] == b'(' {
+                    if let Ok(version) = std::str::from_utf8(&data[i..j]) {
+                        return Some(version.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Detect EROFS version
+fn detect_erofs_version(config: &FuzzerConfig) -> Option<String> {
+    match config.executor_type {
+        ExecutorType::QemuKernel => {
+            // For kernel fuzzing, EROFS is built into the kernel.
+            // Try to find EROFS version from kernel source or config.
+            let kernel_path = &config.kernel_path;
+
+            // Check kernel source directory for EROFS version
+            if let Some(parent) = kernel_path.parent() {
+                // Check common kernel source locations
+                let source_paths = [
+                    parent.join("fs/erofs/erofs.h"),  // In kernel source tree
+                    parent.join("../fs/erofs/erofs.h"), // Relative to arch/x86/boot
+                ];
+
+                for source_path in &source_paths {
+                    if source_path.exists() {
+                        if let Ok(data) = std::fs::read(source_path) {
+                            let data_str = String::from_utf8_lossy(&data);
+                            // Look for EROFS_VERSION or similar macro
+                            for line in data_str.lines() {
+                                if line.contains("EROFS_VERSION") || line.contains("EROFS_VERSION_CODE") {
+                                    // Extract version number from #define
+                                    if let Some(eq_idx) = line.find('"') {
+                                        let rest = &line[eq_idx + 1..];
+                                        if let Some(end_idx) = rest.find('"') {
+                                            return Some(rest[..end_idx].to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check for .config with EROFS enabled
+                let config_paths = [
+                    parent.join(".config"),
+                    parent.join("../.config"),
+                ];
+
+                for config_path in &config_paths {
+                    if config_path.exists() {
+                        if let Ok(data) = std::fs::read(config_path) {
+                            let data_str = String::from_utf8_lossy(&data);
+                            // Just indicate EROFS is enabled in kernel
+                            if data_str.contains("CONFIG_EROFS_FS=y") {
+                                return Some("in-kernel".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Indicate it's in kernel mode, version unknown
+            Some("in-kernel".to_string())
+        }
+        ExecutorType::Erofsfuse => {
+            // Try to get erofsfuse version
+            let erofsfuse_path = &config.erofsfuse_path;
+
+            // Try --version first (may output to stdout or stderr)
+            let output = std::process::Command::new(erofsfuse_path)
+                .arg("--version")
+                .output()
+                .ok();
+
+            if let Some(ref o) = output {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let combined = format!("{} {}", stdout, stderr);
+
+                // Parse version from output like "erofsfuse (erofs-utils) 1.7.1"
+                // or "erofs-utils 1.7.1"
+                for line in combined.lines() {
+                    let line_lower = line.to_lowercase();
+                    if line_lower.contains("erofs") || line_lower.contains("fuse") {
+                        // Try to extract version number (X.Y.Z format)
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        for part in parts {
+                            // Check if this looks like a version number
+                            if part.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                                let version_part: String = part.chars()
+                                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                                    .collect();
+                                if version_part.contains('.') {
+                                    return Some(version_part);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If no version found in parsed lines, return first non-empty line
+                for line in stdout.lines().chain(stderr.lines()) {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+
+            // Try -V flag as fallback
+            let output = std::process::Command::new(erofsfuse_path)
+                .arg("-V")
+                .output()
+                .ok();
+
+            if let Some(o) = output {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+
+                for line in stdout.lines().chain(stderr.lines()) {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::api::{ApiState, ErrorResponse};
@@ -214,4 +215,69 @@ pub async fn get_stats(
         })?;
 
     Ok(Json(stats))
+}
+
+/// Batch operation request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRequest {
+    /// Task IDs to operate on
+    pub ids: Vec<i64>,
+}
+
+/// Batch operation result for a single task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchTaskResult {
+    /// Task ID
+    pub id: i64,
+    /// Error message if failed
+    pub error: String,
+}
+
+/// Batch operation response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResponse {
+    /// Successfully processed task IDs
+    pub success: Vec<i64>,
+    /// Failed operations
+    pub failed: Vec<BatchTaskResult>,
+}
+
+/// Batch stop tasks
+pub async fn batch_stop_tasks(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest>,
+) -> Result<Json<BatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    info!("Batch stopping {} tasks", request.ids.len());
+
+    let mut success = Vec::new();
+    let mut failed = Vec::new();
+
+    for id in request.ids {
+        match state.task_manager.stop_task(id).await {
+            Ok(()) => success.push(id),
+            Err(e) => failed.push(BatchTaskResult { id, error: e }),
+        }
+    }
+
+    Ok(Json(BatchResponse { success, failed }))
+}
+
+/// Batch delete tasks
+pub async fn batch_delete_tasks(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest>,
+) -> Result<Json<BatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    info!("Batch deleting {} tasks", request.ids.len());
+
+    let mut success = Vec::new();
+    let mut failed = Vec::new();
+
+    for id in request.ids {
+        match state.task_manager.delete_task(id).await {
+            Ok(()) => success.push(id),
+            Err(e) => failed.push(BatchTaskResult { id, error: e }),
+        }
+    }
+
+    Ok(Json(BatchResponse { success, failed }))
 }

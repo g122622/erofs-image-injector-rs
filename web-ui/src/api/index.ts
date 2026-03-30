@@ -67,6 +67,21 @@ class ApiClient {
     await this.request(`/tasks/${id}`, { method: 'DELETE' })
   }
 
+  // 批量操作
+  async batchStopTasks(ids: number[]): Promise<{ success: number[]; failed: { id: number; error: string }[] }> {
+    return this.request('/tasks/batch/stop', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    })
+  }
+
+  async batchDeleteTasks(ids: number[]): Promise<{ success: number[]; failed: { id: number; error: string }[] }> {
+    return this.request('/tasks/batch/delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    })
+  }
+
   // 崩溃 API
   async listCrashes(filter?: { task_id?: number; crash_type?: CrashType; limit?: number }): Promise<Crash[]> {
     const params = new URLSearchParams()
