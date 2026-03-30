@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod db;
+pub mod seeds;
 pub mod strategy;
 pub mod strategy_types;
 pub mod task_manager;

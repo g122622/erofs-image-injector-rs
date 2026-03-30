@@ -1,18 +1,24 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useTaskStore } from '@/stores/task'
+import { useSeedStore } from '@/stores/seed'
+import { useNotificationStore } from '@/stores/notification'
 import { api } from '@/api'
 import type { TaskConfig, StrategyTemplate } from '@/types'
+import type { Seed } from '@/types/seed'
 
 const taskStore = useTaskStore()
+const seedStore = useSeedStore()
+const notificationStore = useNotificationStore()
 
 const strategies = ref<StrategyTemplate[]>([])
 const showStrategyGuide = ref(false)
+const showSeedSelector = ref(false)
 
-const createDefaultForm = (): TaskConfig => ({
+const createDefaultForm = (): TaskConfig & { seed_ids: number[] } => ({
   name: '',
   executor_type: 'qemu',
-  seeds_dir: './seeds',
+  seeds_dir: undefined,
   output_dir: './crashes_kernel',
   timeout_seconds: 300,
   max_iterations: 100,
@@ -23,9 +29,11 @@ const createDefaultForm = (): TaskConfig => ({
   qemu_memory: 1024,
   erofsfuse_path: 'erofsfuse',
   strategy_id: undefined,
+  seed_ids: [],
 })
 
-const form = ref<TaskConfig>(createDefaultForm())
+const form = ref(createDefaultForm())
+const selectedSeeds = ref<Seed[]>([])
 
 const submitting = ref(false)
 const error = ref<string | null>(null)
@@ -37,11 +45,14 @@ const selectedStrategy = computed(() => {
 
 onMounted(async () => {
   try {
-    strategies.value = await api.listStrategies()
-    // Show strategy guide if no strategy selected and strategies are loaded
+    const [strategiesData] = await Promise.all([
+      api.listStrategies(),
+      seedStore.fetchSeeds(),
+    ])
+    strategies.value = strategiesData
     showStrategyGuide.value = strategies.value.length > 0 && !form.value.strategy_id
   } catch (e) {
-    console.error('Failed to load strategies:', e)
+    console.error('Failed to load data:', e)
   }
 })
 
@@ -50,11 +61,31 @@ async function handleSubmit() {
   error.value = null
 
   try {
-    const task = await taskStore.createTask(form.value)
+    // Build config with seed_ids
+    const config: TaskConfig = {
+      name: form.value.name,
+      executor_type: form.value.executor_type,
+      seeds_dir: form.value.seeds_dir,
+      output_dir: form.value.output_dir,
+      timeout_seconds: form.value.timeout_seconds,
+      max_iterations: form.value.max_iterations,
+      workers: form.value.workers,
+      qemu_memory: form.value.qemu_memory,
+      kernel_path: form.value.kernel_path,
+      initramfs_path: form.value.initramfs_path,
+      qemu_path: form.value.qemu_path,
+      erofsfuse_path: form.value.erofsfuse_path,
+      strategy_id: form.value.strategy_id,
+      seed_ids: form.value.seed_ids.length > 0 ? form.value.seed_ids : undefined,
+    }
+
+    const task = await taskStore.createTask(config)
     // 自动启动任务
     await taskStore.startTask(task.id)
     // 重置表单
     form.value = createDefaultForm()
+    selectedSeeds.value = []
+    notificationStore.addNotification('task_created', 'success', '任务已创建', `任务 "${task.name}" 已创建并启动`)
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Failed to create task'
   } finally {
@@ -70,6 +101,35 @@ function selectStrategy(strategy: StrategyTemplate | null) {
 function getEnabledMutatorCount(strategy: StrategyTemplate): number {
   return Object.values(strategy.mutators).filter(c => c.enabled).length
 }
+
+function toggleSeed(seed: Seed) {
+  const index = form.value.seed_ids.indexOf(seed.id)
+  if (index > -1) {
+    form.value.seed_ids.splice(index, 1)
+    selectedSeeds.value = selectedSeeds.value.filter(s => s.id !== seed.id)
+  } else {
+    form.value.seed_ids.push(seed.id)
+    selectedSeeds.value.push(seed)
+  }
+}
+
+function removeSeed(seedId: number) {
+  const index = form.value.seed_ids.indexOf(seedId)
+  if (index > -1) {
+    form.value.seed_ids.splice(index, 1)
+    selectedSeeds.value = selectedSeeds.value.filter(s => s.id !== seedId)
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`
+}
+
+const validSeeds = computed(() => seedStore.seeds.filter(s => s.is_valid))
 </script>
 
 <template>
@@ -152,18 +212,83 @@ function getEnabledMutatorCount(strategy: StrategyTemplate): number {
       </select>
     </div>
 
+    <!-- Seed Selection -->
     <div>
-      <label class="block text-sm text-terminal-muted mb-1">Seeds Directory</label>
-      <input
-        v-model="form.seeds_dir"
-        type="text"
-        placeholder="./seeds"
-        class="w-full bg-terminal-bg border border-terminal-border rounded px-3 py-2 text-sm focus:outline-none focus:border-terminal-accent"
-      />
+      <label class="block text-sm text-terminal-muted mb-1">
+        Seeds
+        <span class="text-xs text-terminal-muted ml-2">({{ form.seed_ids.length }} selected)</span>
+      </label>
+
+      <!-- Selected seeds display -->
+      <div v-if="selectedSeeds.length > 0" class="mb-2 flex flex-wrap gap-2">
+        <span
+          v-for="seed in selectedSeeds"
+          :key="seed.id"
+          class="inline-flex items-center gap-1 px-2 py-1 bg-terminal-accent/20 text-terminal-accent text-xs rounded"
+        >
+          {{ seed.name }}
+          <button
+            type="button"
+            @click="removeSeed(seed.id)"
+            class="hover:text-terminal-error"
+          >
+            ×
+          </button>
+        </span>
+      </div>
+
+      <!-- Seed selector dropdown -->
+      <div class="relative">
+        <button
+          type="button"
+          @click="showSeedSelector = !showSeedSelector"
+          class="w-full bg-terminal-bg border border-terminal-border rounded px-3 py-2 text-sm text-left focus:outline-none focus:border-terminal-accent flex items-center justify-between"
+        >
+          <span class="text-terminal-muted">
+            {{ form.seed_ids.length > 0 ? 'Add more seeds...' : 'Select seeds to use...' }}
+          </span>
+          <span class="text-terminal-muted">▼</span>
+        </button>
+
+        <div
+          v-if="showSeedSelector"
+          class="absolute z-10 mt-1 w-full bg-terminal-surface border border-terminal-border rounded shadow-lg max-h-60 overflow-y-auto"
+        >
+          <div v-if="validSeeds.length === 0" class="p-3 text-sm text-terminal-muted text-center">
+            No seeds available. <router-link to="/seeds" class="text-terminal-accent hover:underline">Create seeds first</router-link>
+          </div>
+          <div v-else>
+            <button
+              v-for="seed in validSeeds"
+              :key="seed.id"
+              type="button"
+              @click="toggleSeed(seed)"
+              class="w-full px-3 py-2 text-left text-sm hover:bg-terminal-bg flex items-center justify-between"
+              :class="{ 'bg-terminal-accent/10': form.seed_ids.includes(seed.id) }"
+            >
+              <div>
+                <span class="text-terminal-text">{{ seed.name }}</span>
+                <span class="text-terminal-muted text-xs ml-2">{{ formatBytes(seed.file_size) }}</span>
+              </div>
+              <span
+                v-if="form.seed_ids.includes(seed.id)"
+                class="text-terminal-accent"
+              >✓</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <p class="text-xs text-terminal-muted mt-1">
+        Select seeds from the <router-link to="/seeds" class="text-terminal-accent hover:underline">Seeds</router-link> page.
+        Leave empty to use the default seeds directory.
+      </p>
     </div>
 
     <div>
-      <label class="block text-sm text-terminal-muted mb-1">Output Directory</label>
+      <label class="block text-sm text-terminal-muted mb-1">
+        Output Directory
+      </label>
       <input
         v-model="form.output_dir"
         type="text"

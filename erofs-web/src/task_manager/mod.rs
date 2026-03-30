@@ -36,6 +36,8 @@ pub enum TaskEvent {
     Error { task_id: i64, message: String },
     /// Log message
     Log { task_id: i64, level: LogLevel, message: String, timestamp: i64 },
+    /// Seed tracking during task execution
+    SeedInfo { task_id: i64, current_seed: Option<String>, seed_index: usize, total_seeds: usize },
 }
 
 /// Task manager handle
@@ -106,7 +108,15 @@ impl TaskManager {
 
     /// Create a new task
     pub async fn create_task(&self, config: TaskConfig) -> Result<i64, String> {
-        let config = self.normalize_config(config);
+        let mut config = self.normalize_config(config);
+
+        // Handle seed_ids - prepare seeds directory from selected seeds
+        if let Some(ref seed_ids) = config.seed_ids {
+            if !seed_ids.is_empty() {
+                let seeds_dir = self.prepare_seeds_directory(seed_ids).await?;
+                config.seeds_dir = Some(seeds_dir);
+            }
+        }
 
         // Validate configuration
         self.validate_config(&config)?;
@@ -124,6 +134,79 @@ impl TaskManager {
         self.try_start_next().await?;
 
         Ok(task_id)
+    }
+
+    /// Prepare a temporary directory with symlinks to selected seeds
+    async fn prepare_seeds_directory(&self, seed_ids: &[i64]) -> Result<String, String> {
+        use std::os::unix::fs as unix_fs;
+
+        // Create a unique directory for this task's seeds
+        let task_seeds_dir = std::env::temp_dir()
+            .join("erofs-fuzzer-seeds")
+            .join(format!("task-{}", chrono::Utc::now().timestamp_micros()));
+
+        std::fs::create_dir_all(&task_seeds_dir)
+            .map_err(|e| format!("Failed to create seeds directory: {}", e))?;
+
+        let mut found_count = 0;
+        let mut missing_seeds = Vec::new();
+
+        for &seed_id in seed_ids {
+            match self.db.get_seed(seed_id).await {
+                Ok(Some(seed)) => {
+                    if !seed.is_valid {
+                        missing_seeds.push(format!("Seed {} ({}) is invalid", seed_id, seed.name));
+                        continue;
+                    }
+
+                    let source_path = std::path::Path::new(&seed.file_path);
+                    if !source_path.exists() {
+                        missing_seeds.push(format!("Seed {} ({}) file not found: {}", seed_id, seed.name, seed.file_path));
+                        continue;
+                    }
+
+                    // Create symlink to the seed file
+                    let link_path = task_seeds_dir.join(format!("{}.erofs", seed.name));
+
+                    // Remove existing symlink if any
+                    let _ = std::fs::remove_file(&link_path);
+
+                    #[cfg(unix)]
+                    {
+                        unix_fs::symlink(source_path, &link_path)
+                            .map_err(|e| format!("Failed to create symlink for seed {}: {}", seed_id, e))?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Fallback: copy the file on non-Unix systems
+                        std::fs::copy(source_path, &link_path)
+                            .map_err(|e| format!("Failed to copy seed {}: {}", seed_id, e))?;
+                    }
+
+                    found_count += 1;
+                }
+                Ok(None) => {
+                    missing_seeds.push(format!("Seed {} not found", seed_id));
+                }
+                Err(e) => {
+                    missing_seeds.push(format!("Error fetching seed {}: {}", seed_id, e));
+                }
+            }
+        }
+
+        if found_count == 0 {
+            // Clean up empty directory
+            let _ = std::fs::remove_dir_all(&task_seeds_dir);
+            return Err(format!("No valid seeds found. {}", missing_seeds.join("; ")));
+        }
+
+        if !missing_seeds.is_empty() {
+            info!("Some seeds were skipped: {}", missing_seeds.join("; "));
+        }
+
+        info!("Prepared seeds directory at {:?} with {} seeds", task_seeds_dir, found_count);
+
+        Ok(task_seeds_dir.to_string_lossy().to_string())
     }
 
     /// Start a task
@@ -295,8 +378,12 @@ impl TaskManager {
     /// Validate task configuration
     fn validate_config(&self, config: &TaskConfig) -> Result<(), String> {
         // Check seeds directory
-        if !std::path::Path::new(&config.seeds_dir).exists() {
-            return Err(format!("Seeds directory not found: {}", config.seeds_dir));
+        if let Some(ref seeds_dir) = config.seeds_dir {
+            if !std::path::Path::new(seeds_dir).exists() {
+                return Err(format!("Seeds directory not found: {}", seeds_dir));
+            }
+        } else if config.seed_ids.is_none() || config.seed_ids.as_ref().map_or(true, |ids| ids.is_empty()) {
+            return Err("Either seeds_dir or seed_ids must be provided".to_string());
         }
 
         // Check executor-specific requirements
@@ -339,6 +426,7 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Normalize task configuration
     fn normalize_config(&self, mut config: TaskConfig) -> TaskConfig {
         fn normalize_optional_string(value: Option<String>) -> Option<String> {
             value
@@ -348,6 +436,11 @@ impl TaskManager {
 
         config.qemu_path = normalize_optional_string(config.qemu_path);
         config.erofsfuse_path = normalize_optional_string(config.erofsfuse_path);
+
+        // Set default seeds_dir if not provided
+        if config.seeds_dir.is_none() && config.seed_ids.is_none() {
+            config.seeds_dir = Some("./seeds".to_string());
+        }
 
         match config.executor_type {
             ExecutorType::Qemu => {

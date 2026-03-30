@@ -87,8 +87,9 @@ export const useNotificationStore = defineStore('notification', () => {
     message: string,
     taskId?: number
   ) {
-    // 检查该事件是否启用
-    if (!config.value.events[event]) {
+    // 检查该事件是否启用（如果事件不在配置中，默认启用）
+    const eventEnabled = config.value.events[event]
+    if (eventEnabled === false) {
       return
     }
 

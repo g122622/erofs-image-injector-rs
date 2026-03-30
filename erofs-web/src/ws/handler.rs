@@ -113,6 +113,7 @@ fn should_send_event(state: &ConnectionState, event: &TaskEvent) -> bool {
         TaskEvent::Finished { task_id, .. } => *task_id,
         TaskEvent::Error { task_id, .. } => *task_id,
         TaskEvent::Log { task_id, .. } => *task_id,
+        TaskEvent::SeedInfo { task_id, .. } => *task_id,
     };
 
     state.subscribed_tasks.contains(&task_id)
@@ -168,6 +169,14 @@ fn event_to_message(event: &TaskEvent) -> String {
                 level: *level,
                 message: message.clone(),
                 timestamp: *timestamp,
+            }
+        }
+        TaskEvent::SeedInfo { task_id, current_seed, seed_index, total_seeds } => {
+            ServerMessage::SeedInfo {
+                task_id: *task_id,
+                current_seed: current_seed.clone(),
+                seed_index: *seed_index,
+                total_seeds: *total_seeds,
             }
         }
     };

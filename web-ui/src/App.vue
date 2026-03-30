@@ -212,6 +212,13 @@ onUnmounted(() => {
               >
                 Strategies
               </router-link>
+              <router-link
+                to="/seeds"
+                class="text-terminal-muted hover:text-terminal-text transition-colors"
+                active-class="text-terminal-accent"
+              >
+                Seeds
+              </router-link>
             </nav>
           </div>
           <div class="flex items-center gap-4">

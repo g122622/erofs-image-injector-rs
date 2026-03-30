@@ -246,7 +246,12 @@ fn load_seeds(state: &mut SimpleFuzzerState, config: &FuzzerConfig) -> FuzzerRes
                 // Load the file
                 match std::fs::read(&path) {
                     Ok(data) => {
-                        let input = ErofsImageInput::new(data);
+                        // Get file name for tracking
+                        let name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let input = ErofsImageInput::with_name(data, &name);
                         state.seeds.push(input);
                         count += 1;
                         debug!("Loaded seed: {:?}", path);
@@ -474,6 +479,16 @@ fn run_simple_fuzzer(config: &FuzzerConfig, state: &mut SimpleFuzzerState) -> Fu
         }
 
         let seed_idx = state.rand.below(NonZeroUsize::new(state.seeds.len()).unwrap());
+
+        // Get seed name for tracking
+        let seed_name = state.seeds[seed_idx].name()
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Output seed tracking info for UI
+        println!("[SEED] index={} total={} name={}",
+                 seed_idx, state.seeds.len(), seed_name);
+        let _ = std::io::stdout().flush();
 
         // Get the input from corpus
         let input = state.seeds[seed_idx].clone();

@@ -3,6 +3,7 @@
 mod tasks;
 mod crashes;
 mod strategies;
+mod seeds;
 
 use axum::{
     routing::{get, post, put, delete, Router},
@@ -18,6 +19,7 @@ use crate::strategy::StrategyStorage;
 pub use tasks::*;
 pub use crashes::*;
 pub use strategies::*;
+pub use seeds::*;
 
 /// API state shared by handlers
 #[derive(Debug, Clone)]
@@ -52,6 +54,14 @@ pub fn create_router() -> Router<ApiState> {
         .route("/api/strategies/:id/export", get(export_strategy))
         .route("/api/strategies/import", post(import_strategy))
         .route("/api/strategies/import-file", post(import_strategy_file))
+        // Seed endpoints
+        .route("/api/seeds", get(list_seeds))
+        .route("/api/seeds/generate", post(generate_seeds))
+        .route("/api/seeds/upload", post(upload_seed))
+        .route("/api/seeds/templates", get(list_templates))
+        .route("/api/seeds/templates/:id", get(get_template))
+        .route("/api/seeds/:id", get(get_seed).delete(delete_seed))
+        .route("/api/seeds/:id/download", get(download_seed))
         // Stats endpoint
         .route("/api/stats", get(get_stats))
         // Health check

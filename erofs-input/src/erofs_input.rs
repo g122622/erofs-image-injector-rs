@@ -31,6 +31,10 @@ pub struct ErofsImageInput {
     /// Cached root inode offset
     #[serde(skip)]
     root_inode_offset: Option<u64>,
+
+    /// Optional name/source of this input (e.g., file name)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 impl Hash for ErofsImageInput {
@@ -216,8 +220,16 @@ impl ErofsImageInput {
             injection_points: Vec::new(),
             super_block: None,
             root_inode_offset: None,
+            name: None,
         };
         input.parse_injection_points();
+        input
+    }
+
+    /// Create a new EROFS image input with a name
+    pub fn with_name(data: Vec<u8>, name: impl Into<String>) -> Self {
+        let mut input = Self::new(data);
+        input.name = Some(name.into());
         input
     }
 
@@ -250,6 +262,16 @@ impl ErofsImageInput {
     /// Check if the image is empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Get the name of this input
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Set the name of this input
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = Some(name.into());
     }
 
     /// Parse the super block

@@ -1,13 +1,13 @@
-// 任务状态
+// Task status
 export type TaskStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
 
-// 执行器类型
+// Executor type
 export type ExecutorType = 'erofsfuse' | 'qemu'
 
-// 崩溃类型
+// Crash type
 export type CrashType = 'Signal' | 'ASan' | 'KernelPanic' | 'KernelOops'
 
-// 变异器类型
+// Mutator type
 export type MutatorType =
   | 'bitflip'
   | 'random'
@@ -22,8 +22,11 @@ export type MutatorType =
   | 'xattr'
   | 'targeted'
 
-// 层级类型
+// Layer type
 export type LayerType = 'superblock' | 'inode' | 'dirent' | 'data_block'
+
+// Export seed types
+export * from './seed'
 
 // 变异器配置
 export interface MutatorConfig {
@@ -125,7 +128,7 @@ export interface StrategyStats {
 export interface TaskConfig {
   name: string
   executor_type: ExecutorType
-  seeds_dir: string
+  seeds_dir?: string  // Optional - will be derived from selected seeds
   output_dir: string
   timeout_seconds: number
   max_iterations: number
@@ -136,6 +139,7 @@ export interface TaskConfig {
   qemu_path?: string
   erofsfuse_path?: string
   strategy_id?: number
+  seed_ids?: number[]  // Selected seed IDs from seed management
 }
 
 // 任务

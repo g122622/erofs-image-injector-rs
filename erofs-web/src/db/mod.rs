@@ -92,6 +92,9 @@ impl Database {
         let conn = self.inner.lock().await;
         let now = chrono::Utc::now().timestamp();
 
+        // Use provided seeds_dir or empty string as placeholder
+        let seeds_dir = config.seeds_dir.as_deref().unwrap_or("");
+
         conn.execute(
             r#"
             INSERT INTO tasks (
@@ -106,7 +109,7 @@ impl Database {
             params![
                 config.name,
                 config.executor_type.to_string(),
-                config.seeds_dir,
+                seeds_dir,
                 config.output_dir,
                 config.timeout_seconds as i64,
                 config.max_iterations as i64,
@@ -552,6 +555,227 @@ impl Database {
         let conn = self.inner.lock().await;
         conn.execute("DELETE FROM mutator_stats WHERE task_id = ?1", params![task_id])?;
         Ok(())
+    }
+
+    // ========== Seed operations ==========
+
+    /// Create a new seed
+    pub async fn create_seed(
+        &self,
+        name: &str,
+        file_path: &str,
+        file_size: i64,
+        checksum: Option<&str>,
+        config: &SeedConfig,
+    ) -> SqliteResult<i64> {
+        let conn = self.inner.lock().await;
+        let now = chrono::Utc::now().timestamp();
+        let config_json = serde_json::to_string(config).map_err(|_| {
+            rusqlite::Error::InvalidParameterName("Failed to serialize config".to_string())
+        })?;
+
+        conn.execute(
+            r#"
+            INSERT INTO seeds (name, file_path, file_size, checksum, config, times_used, crashes_found, created_at, is_valid)
+            VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, 1)
+            "#,
+            params![name, file_path, file_size, checksum, config_json, now],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get a seed by ID
+    pub async fn get_seed(&self, id: i64) -> SqliteResult<Option<Seed>> {
+        let conn = self.inner.lock().await;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, file_path, file_size, checksum, config, times_used, crashes_found,
+                   created_at, updated_at, is_valid, tags
+            FROM seeds WHERE id = ?1
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![id], |row| {
+            let config_json: String = row.get(5)?;
+            let config: SeedConfig = serde_json::from_str(&config_json).map_err(|_| {
+                rusqlite::Error::InvalidParameterName("Failed to deserialize config".to_string())
+            })?;
+            Ok(Seed {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                file_path: row.get(2)?,
+                file_size: row.get(3)?,
+                checksum: row.get(4)?,
+                config,
+                times_used: row.get(6)?,
+                crashes_found: row.get(7)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(8)?, 0)
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: row.get::<_, Option<i64>>(9)?.and_then(|t| {
+                    chrono::DateTime::from_timestamp(t, 0)
+                }),
+                is_valid: row.get::<_, i64>(10)? != 0,
+                tags: row.get(11)?,
+            })
+        });
+
+        match result {
+            Ok(seed) => Ok(Some(seed)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List seeds with filter
+    pub async fn list_seeds(&self, filter: &SeedFilter) -> SqliteResult<Vec<Seed>> {
+        let conn = self.inner.lock().await;
+
+        let mut sql = String::from(
+            "SELECT id, name, file_path, file_size, checksum, config, times_used, crashes_found, \
+             created_at, updated_at, is_valid, tags FROM seeds WHERE 1=1"
+        );
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(is_valid) = filter.is_valid {
+            sql.push_str(" AND is_valid = ?");
+            bind_params.push(Box::new(if is_valid { 1i64 } else { 0i64 }));
+        }
+
+        if let Some(tag) = &filter.tag {
+            sql.push_str(" AND tags LIKE ?");
+            bind_params.push(Box::new(format!("%{}%", tag)));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        if let Some(limit) = filter.limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        if let Some(offset) = filter.offset {
+            sql.push_str(&format!(" OFFSET {}", offset));
+        }
+
+        let params: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let seeds = stmt.query_map(params.as_slice(), |row| {
+            let config_json: String = row.get(5)?;
+            let config: SeedConfig = serde_json::from_str(&config_json).map_err(|_| {
+                rusqlite::Error::InvalidParameterName("Failed to deserialize config".to_string())
+            })?;
+            Ok(Seed {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                file_path: row.get(2)?,
+                file_size: row.get(3)?,
+                checksum: row.get(4)?,
+                config,
+                times_used: row.get(6)?,
+                crashes_found: row.get(7)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(8)?, 0)
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: row.get::<_, Option<i64>>(9)?.and_then(|t| {
+                    chrono::DateTime::from_timestamp(t, 0)
+                }),
+                is_valid: row.get::<_, i64>(10)? != 0,
+                tags: row.get(11)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(seeds)
+    }
+
+    /// Update seed usage statistics
+    pub async fn update_seed_stats(&self, id: i64, times_used_delta: i64, crashes_delta: i64) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        let now = chrono::Utc::now().timestamp();
+
+        conn.execute(
+            "UPDATE seeds SET times_used = times_used + ?1, crashes_found = crashes_found + ?2, updated_at = ?3 WHERE id = ?4",
+            params![times_used_delta, crashes_delta, now, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Delete a seed
+    pub async fn delete_seed(&self, id: i64) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        conn.execute("DELETE FROM seeds WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Update seed validity
+    pub async fn update_seed_validity(&self, id: i64, is_valid: bool) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        conn.execute(
+            "UPDATE seeds SET is_valid = ?1 WHERE id = ?2",
+            params![if is_valid { 1i64 } else { 0i64 }, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record seed usage for a task
+    pub async fn record_seed_usage(
+        &self,
+        seed_id: i64,
+        task_id: i64,
+        seed_index: i64,
+    ) -> SqliteResult<()> {
+        let conn = self.inner.lock().await;
+        let now = chrono::Utc::now().timestamp();
+
+        conn.execute(
+            r#"
+            INSERT INTO seed_task_usage (seed_id, task_id, seed_index, iterations, crashes, created_at)
+            VALUES (?1, ?2, ?3, 0, 0, ?4)
+            ON CONFLICT(seed_id, task_id) DO UPDATE SET seed_index = excluded.seed_index
+            "#,
+            params![seed_id, task_id, seed_index, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get seed statistics for a task
+    pub async fn get_seed_stats_for_task(&self, task_id: i64) -> SqliteResult<Vec<SeedTaskStats>> {
+        let conn = self.inner.lock().await;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.id, s.name, stu.seed_index, stu.iterations, stu.crashes
+            FROM seed_task_usage stu
+            JOIN seeds s ON stu.seed_id = s.id
+            WHERE stu.task_id = ?1
+            ORDER BY stu.seed_index
+            "#,
+        )?;
+
+        let stats = stmt.query_map(params![task_id], |row| {
+            Ok(SeedTaskStats {
+                seed_id: row.get(0)?,
+                seed_name: row.get(1)?,
+                seed_index: row.get(2)?,
+                iterations: row.get(3)?,
+                crashes: row.get(4)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(stats)
+    }
+
+    /// Check if seed exists by checksum
+    pub async fn seed_exists_by_checksum(&self, checksum: &str) -> SqliteResult<bool> {
+        let conn = self.inner.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM seeds WHERE checksum = ?1",
+            params![checksum],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 }
 

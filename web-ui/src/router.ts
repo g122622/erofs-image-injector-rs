@@ -28,6 +28,11 @@ const router = createRouter({
       name: 'strategies',
       component: () => import('@/views/Strategies.vue'),
     },
+    {
+      path: '/seeds',
+      name: 'seeds',
+      component: () => import('@/views/Seeds.vue'),
+    },
   ],
 })
 

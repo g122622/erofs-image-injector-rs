@@ -81,4 +81,42 @@ CREATE TABLE IF NOT EXISTS mutator_stats (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mutator_stats_task_id ON mutator_stats(task_id);
+
+-- Seeds table for seed management
+CREATE TABLE IF NOT EXISTS seeds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    file_path TEXT NOT NULL UNIQUE,
+    file_size INTEGER NOT NULL,
+    checksum TEXT,
+    config TEXT NOT NULL,
+    times_used INTEGER DEFAULT 0,
+    crashes_found INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER,
+    is_valid INTEGER DEFAULT 1,
+    tags TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_seeds_name ON seeds(name);
+CREATE INDEX IF NOT EXISTS idx_seeds_created_at ON seeds(created_at);
+CREATE INDEX IF NOT EXISTS idx_seeds_is_valid ON seeds(is_valid);
+
+-- Seed task usage tracking
+CREATE TABLE IF NOT EXISTS seed_task_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seed_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    seed_index INTEGER,
+    iterations INTEGER DEFAULT 0,
+    crashes INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+
+    FOREIGN KEY (seed_id) REFERENCES seeds(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    UNIQUE(seed_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_seed_task_usage_seed ON seed_task_usage(seed_id);
+CREATE INDEX IF NOT EXISTS idx_seed_task_usage_task ON seed_task_usage(task_id);
 "#;

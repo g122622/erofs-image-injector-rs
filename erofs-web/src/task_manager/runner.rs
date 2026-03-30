@@ -46,6 +46,10 @@ pub struct TaskRunner {
     current_speed: f64,
     /// Total seeds count (parsed from fuzzer output)
     total_seeds: usize,
+    /// Current seed index
+    current_seed_index: usize,
+    /// Current seed name
+    current_seed_name: Option<String>,
     /// Max iterations (parsed from fuzzer output)
     max_iterations: u64,
     /// Kernel version (parsed from fuzzer output)
@@ -76,6 +80,8 @@ impl TaskRunner {
             current_crashes: 0,
             current_speed: 0.0,
             total_seeds: 0,
+            current_seed_index: 0,
+            current_seed_name: None,
             max_iterations: 0,
             kernel_version: None,
             erofs_version: None,
@@ -195,6 +201,30 @@ impl TaskRunner {
                         debug!("[Task {}] Mutator: {}", self.task.id, mutator);
                         self.current_mutator = Some(mutator);
                     }
+                }
+                // Parse seed info: [SEED] index=N total=M name=xxx
+                else if line.starts_with("[SEED]") {
+                    // Parse: [SEED] index=0 total=2 name=basic.erofs
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    for part in parts {
+                        if let Some(val) = part.strip_prefix("index=") {
+                            self.current_seed_index = val.parse().unwrap_or(0);
+                        } else if let Some(val) = part.strip_prefix("total=") {
+                            self.total_seeds = val.parse().unwrap_or(self.total_seeds);
+                        } else if let Some(val) = part.strip_prefix("name=") {
+                            self.current_seed_name = Some(val.to_string());
+                        }
+                    }
+                    debug!("[Task {}] Seed: index={}, total={}, name={:?}",
+                           self.task.id, self.current_seed_index, self.total_seeds, self.current_seed_name);
+
+                    // Send seed info event
+                    let _ = self.event_tx.send(TaskEvent::SeedInfo {
+                        task_id: self.task.id,
+                        current_seed: self.current_seed_name.clone(),
+                        seed_index: self.current_seed_index,
+                        total_seeds: self.total_seeds,
+                    });
                 }
             }
 
